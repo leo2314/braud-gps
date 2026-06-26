@@ -5,10 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Braud SB35 — Guidage de vendange</title>
 
-<!-- Leaflet.js : cartographie -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<!-- Turf.js : disponible si l'on préfère ses fonctions géométriques à la trigonométrie maison (voir commentaires dans le JS) -->
 <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
 
 <style>
@@ -169,14 +167,8 @@
 </head>
 <body>
 
-<!-- ============================================================
-     CARTE
-     ============================================================ -->
 <div id="carte"></div>
 
-<!-- ============================================================
-     BANDEAU DE DIAGNOSTICS
-     ============================================================ -->
 <div id="bandeau">
   <div class="instrument">
     <span class="instrument-label">Statut GPS</span>
@@ -193,23 +185,17 @@
   <button id="bouton-panneau" aria-label="Réglages">⚙</button>
 </div>
 
-<!-- ============================================================
-     VOILE + PANNEAU DE CONFIGURATION
-     ============================================================ -->
 <div id="voile"></div>
 <div id="panneau">
   <div class="panneau-titre">Tracé de peinture</div>
-
   <div class="champ">
     <label for="champ-largeur">Largeur de travail (m)</label>
     <input type="number" id="champ-largeur" min="0.1" step="0.1" value="2.50">
   </div>
-
   <div class="champ">
     <label for="champ-offset">Déport latéral (m)</label>
     <input type="number" id="champ-offset" min="0" step="0.1" value="1.20">
   </div>
-
   <div class="champ">
     <label>Côté du déport</label>
     <div class="segmente">
@@ -217,11 +203,9 @@
       <button id="cote-droite" data-cote="droite" class="actif">Droite ▶</button>
     </div>
   </div>
-
   <button class="bouton-secondaire alerte" id="bouton-effacer">Effacer les tracés</button>
 
   <div class="panneau-titre">Connexion ESP32 / GNSS</div>
-
   <div class="champ">
     <label for="champ-ws">Adresse WebSocket de l'ESP32</label>
     <input type="text" id="champ-ws" value="ws://192.168.4.1:81">
@@ -236,9 +220,6 @@
   </div>
 </div>
 
-<!-- ============================================================
-     COMMANDES DE SIMULATION (mode démo bureau)
-     ============================================================ -->
 <div id="simulation">
   <button id="sim-gauche" aria-label="Tourner à gauche">↺</button>
   <button id="sim-marche">▶ AUTO</button>
@@ -246,9 +227,6 @@
   <button id="sim-avance" aria-label="Avancer d'un pas">⤒</button>
 </div>
 
-<!-- ============================================================
-     GROS BOUTON PEINTURE
-     ============================================================ -->
 <button id="bouton-peinture">
   <span class="icone-pinceau">🖌</span>
   <span id="texte-peinture">PEINTURE : OFF</span>
@@ -259,20 +237,30 @@
    ÉTAT GLOBAL DE L'APPLICATION
    ================================================================ */
 const etat = {
-  derniereLat: 47.12237054999479,          // position de démarrage (vignoble de démonstration)
+  derniereLat: 47.12237054999479,          
   derniereLon: -1.3570622967314048,
   dernierCap: 0,
   vitesseKmh: 0,
   peintureActive: false,
-  source: 'SIMULATION',          // 'SIMULATION' | 'RTK_FIX' | 'RTK_FLOAT' | 'DECONNECTE'
+  source: 'SIMULATION',          
   suivreCamera: true,
-  cote: 'droite',                // 'gauche' | 'droite'
+  cote: 'droite',                
   largeurM: 2.50,
   offsetM: 1.20,
   dernierePositionTemps: null
 };
 
-let traceCourante = null;   // tracé en cours d'extension (objet {gauche:[], droite:[], polygone})
+// Variables pour le lissage fluide (Interpolation 60 FPS)
+const lissage = {
+  latCible: 47.12237054999479,
+  lonCible: -1.3570622967314048,
+  capCible: 0,
+  latAffichee: 47.12237054999479,
+  lonAffichee: -1.3570622967314048,
+  capAffiche: 0
+};
+
+let traceCourante = null;
 let websocket = null;
 
 /* ================================================================
@@ -297,19 +285,15 @@ const coucheOSM = L.tileLayer(
 L.control.layers({ 'Satellite': coucheSatellite, 'Plan (OSM)': coucheOSM }, {}, { position:'bottomleft' }).addTo(carte);
 
 /* ================================================================
-   2. ICÔNE DE LA MACHINE (silhouette d'enjambeur, vue de dessus)
+   2. ICÔNE DE LA MACHINE
    ================================================================ */
 function svgMachine(){
   return `
     <svg viewBox="0 0 60 100" xmlns="http://www.w3.org/2000/svg">
       <g>
-        <!-- Pointe avant : indique le cap -->
         <polygon points="30,4 40,26 20,26" fill="#5FD16B" />
-        <!-- Corps principal -->
         <rect x="14" y="24" width="32" height="58" rx="10" fill="#131F19" stroke="#5FD16B" stroke-width="3"/>
-        <!-- Tunnel de secouage (structure qui enjambe le rang) -->
         <rect x="2" y="40" width="56" height="14" rx="4" fill="#131F19" stroke="#5FD16B" stroke-width="2.5"/>
-        <!-- Point central (axe antenne GNSS) -->
         <circle cx="30" cy="58" r="4" fill="#5FD16B"/>
       </g>
     </svg>`;
@@ -326,31 +310,22 @@ const marqueurMachine = L.marker([etat.derniereLat, etat.derniereLon], {
   icon: iconeMachine, interactive:false, keyboard:false
 }).addTo(carte);
 
-// Applique la rotation visuelle au div de l'icône, sans le reconstruire (perf à 10 Hz)
 function orienterIcone(capDeg){
   const elt = marqueurMachine.getElement();
   if (elt) elt.style.transform += ` rotate(${capDeg}deg)`;
-  // Note : Leaflet réécrit déjà 'transform' pour le positionnement (translate3d).
-  // On combine donc translation (gérée par Leaflet) + rotation (gérée ici) à chaque trame.
 }
-// Leaflet régénère le style 'transform' à chaque déplacement du marqueur ; on doit
-// donc ré-appliquer la rotation juste après avoir appelé setLatLng (voir updateGPSData).
 
 /* ================================================================
-   3. MATHÉMATIQUES — point de destination par cap + distance
-   ================================================================
-   Formule classique de trigonométrie sphérique (cap + distance -> nouveau point),
-   équivalente à turf.destination(). On la réécrit ici pour rester autonome
-   (utilisable hors-ligne, sans dépendre d'une librairie tierce en cabine).
-*/
-const RAYON_TERRE = 6378137; // mètres (rayon moyen WGS84)
+   3. MATHÉMATIQUES — point de destination
+   ================================================================ */
+const RAYON_TERRE = 6378137; 
 
 function normaliserCap(deg){
   return ((deg % 360) + 360) % 360;
 }
 
 function pointDestination(latDeg, lonDeg, capDeg, distanceM){
-  const delta = distanceM / RAYON_TERRE;           // distance angulaire
+  const delta = distanceM / RAYON_TERRE;
   const theta = capDeg * Math.PI / 180;
   const phi1  = latDeg * Math.PI / 180;
   const lambda1 = lonDeg * Math.PI / 180;
@@ -368,14 +343,8 @@ function pointDestination(latDeg, lonDeg, capDeg, distanceM){
     lat: phi2 * 180 / Math.PI,
     lon: (((lambda2 * 180 / Math.PI) + 540) % 360) - 180
   };
-
-  // Équivalent avec Turf.js, si préféré :
-  // const pt = turf.destination([lonDeg, latDeg], distanceM/1000, capDeg, {units:'kilometers'});
-  // return { lat: pt.geometry.coordinates[1], lon: pt.geometry.coordinates[0] };
 }
 
-/* Calcule le centre du pinceau (décalé du déport) et ses deux bords
-   (gauche/droite, espacés de la largeur de travail), perpendiculaires au cap. */
 function calculerPinceau(latDeg, lonDeg, capDeg, cote, offsetM, largeurM){
   const capOffset = normaliserCap(cote === 'droite' ? capDeg + 90 : capDeg - 90);
   const centre = pointDestination(latDeg, lonDeg, capOffset, offsetM);
@@ -409,7 +378,6 @@ function ajouterPointPeinture(latDeg, lonDeg, capDeg){
   traceCourante.pointsGauche.push([bordGauche.lat, bordGauche.lon]);
   traceCourante.pointsDroite.push([bordDroit.lat, bordDroit.lon]);
 
-  // Le ruban est formé du bord gauche (dans l'ordre) puis du bord droit (inversé)
   const ruban = traceCourante.pointsGauche.concat(traceCourante.pointsDroite.slice().reverse());
   traceCourante.polygone.setLatLngs(ruban);
 }
@@ -419,7 +387,7 @@ function definirPeinture(active){
   document.getElementById('bouton-peinture').classList.toggle('actif', active);
   document.getElementById('texte-peinture').textContent = active ? 'PEINTURE : ON' : 'PEINTURE : OFF';
   if (active) demarrerNouveauTrace();
-  else traceCourante = null; // le ruban déjà tracé reste affiché ; on arrête juste de l'étendre
+  else traceCourante = null; 
 }
 
 document.getElementById('bouton-peinture').addEventListener('click', () => {
@@ -433,31 +401,29 @@ document.getElementById('bouton-effacer').addEventListener('click', () => {
 });
 
 /* ================================================================
-   5. FONCTION PRINCIPALE — POINT D'ENTRÉE POUR LES DONNÉES GNSS RÉELLES
-   ================================================================
-   >>> C'est ICI que les vraies trames de l'ESP32 (UM982, 10 Hz) doivent
-   >>> être injectées : updateGPSData(latitude, longitude, capDegres, vitesseKmhOptionnelle).
-*/
+   5. FONCTION PRINCIPALE — POINT D'ENTRÉE GNSS & LISSAGE
+   ================================================================ */
 function updateGPSData(lat, lon, heading, vitesseKmh){
   heading = normaliserCap(heading);
 
-  // Vitesse : utilise celle fournie par la trame, sinon la déduit du déplacement
   const vitesse = (typeof vitesseKmh === 'number')
     ? vitesseKmh
     : calculerVitesseDepuisPositions(lat, lon);
 
-  // --- Déplacement du marqueur + orientation ---
-  marqueurMachine.setLatLng([lat, lon]);
-  orienterIcone(heading);
-  if (etat.suivreCamera) carte.panTo([lat, lon], { animate:false });
+  // Stockage des cibles pour le lissage de l'animation
+  lissage.latCible = lat;
+  lissage.lonCible = lon;
+  
+  // Correction anti-rebond du cap (passage de 359° à 0°)
+  let diffCap = heading - lissage.capCible;
+  if (diffCap > 180) diffCap -= 360;
+  if (diffCap < -180) diffCap += 360;
+  lissage.capCible = lissage.capCible + diffCap;
 
-  // --- Peinture ---
+  // Calcul et affichage immédiat de la peinture
   ajouterPointPeinture(lat, lon, heading);
-
-  // --- Bandeau de diagnostics ---
   majBandeau(heading, vitesse);
 
-  // --- Mémorisation pour le prochain calcul de vitesse/temps ---
   etat.derniereLat = lat;
   etat.derniereLon = lon;
   etat.dernierCap = heading;
@@ -465,12 +431,29 @@ function updateGPSData(lat, lon, heading, vitesseKmh){
   etat.dernierePositionTemps = performance.now();
 }
 
+// === BOUCLE D'ANIMATION (60 FPS) ===
+function boucleAnimationFluide() {
+  const k = 0.18; // Force du lissage (plus bas = plus fluide mais léger retard)
+  
+  lissage.latAffichee += (lissage.latCible - lissage.latAffichee) * k;
+  lissage.lonAffichee += (lissage.lonCible - lissage.lonAffichee) * k;
+  lissage.capAffiche += (lissage.capCible - lissage.capAffiche) * k;
+
+  marqueurMachine.setLatLng([lissage.latAffichee, lissage.lonAffichee]);
+  orienterIcone(normaliserCap(lissage.capAffiche));
+
+  if (etat.suivreCamera) {
+    carte.setView([lissage.latAffichee, lissage.lonAffichee], carte.getZoom(), { animate: false });
+  }
+
+  requestAnimationFrame(boucleAnimationFluide);
+}
+
 function calculerVitesseDepuisPositions(lat, lon){
   if (etat.dernierePositionTemps === null) return 0;
   const dtSecondes = (performance.now() - etat.dernierePositionTemps) / 1000;
   if (dtSecondes <= 0) return etat.vitesseKmh;
 
-  // Distance haversine entre l'ancienne et la nouvelle position
   const R = RAYON_TERRE;
   const phi1 = etat.derniereLat * Math.PI/180, phi2 = lat * Math.PI/180;
   const dPhi = (lat - etat.derniereLat) * Math.PI/180;
@@ -478,7 +461,7 @@ function calculerVitesseDepuisPositions(lat, lon){
   const a = Math.sin(dPhi/2)**2 + Math.cos(phi1)*Math.cos(phi2)*Math.sin(dLambda/2)**2;
   const distanceM = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 
-  return (distanceM / dtSecondes) * 3.6; // m/s -> km/h
+  return (distanceM / dtSecondes) * 3.6; 
 }
 
 function majBandeau(capDeg, vitesseKmh){
@@ -500,14 +483,10 @@ function majStatutSource(){
 
 /* ================================================================
    6. CONNEXION TEMPS RÉEL À L'ESP32 (WebSocket)
-   ================================================================
-   Trame JSON attendue de l'ESP32, ex. :
-   { "lat":45.1679, "lon":-0.7459, "heading":87.4, "speed":6.2, "fix":"RTK_FIX" }
-*/
+   ================================================================ */
 function connecterWebSocket(url){
   try{
     websocket = new WebSocket(url);
-
     websocket.onopen = () => { etat.source = 'RTK_FLOAT'; majStatutSource(); arreterSimulation(); };
     websocket.onclose = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
     websocket.onerror = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
@@ -529,26 +508,18 @@ function connecterWebSocket(url){
   }
 }
 
-/* Alternative par requêtes HTTP (si l'ESP32 expose un serveur REST plutôt qu'un WebSocket) :
-   setInterval(async () => {
-     const reponse = await fetch('http://192.168.4.1/position');
-     const trame = await reponse.json();
-     updateGPSData(trame.lat, trame.lon, trame.heading, trame.speed);
-   }, 100); // 10 Hz
-*/
-
 document.getElementById('bouton-connexion').addEventListener('click', () => {
   const url = document.getElementById('champ-ws').value.trim();
   if (url) connecterWebSocket(url);
 });
 
 /* ================================================================
-   7. MODE SIMULATION (test au bureau, sans ESP32)
+   7. MODE SIMULATION
    ================================================================ */
 const simulation = { actif:false, intervalle:null, vitesseKmh:5 };
 
 function pasSimulation(){
-  const distanceM = (simulation.vitesseKmh / 3.6) * 0.1; // déplacement en 100 ms (10 Hz)
+  const distanceM = (simulation.vitesseKmh / 3.6) * 0.1; 
   const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, distanceM);
   updateGPSData(destination.lat, destination.lon, etat.dernierCap, simulation.vitesseKmh);
 }
@@ -573,21 +544,19 @@ document.getElementById('sim-marche').addEventListener('click', () => {
 });
 document.getElementById('sim-gauche').addEventListener('click', () => {
   etat.dernierCap = normaliserCap(etat.dernierCap - 8);
-  orienterIcone(etat.dernierCap);
-  majBandeau(etat.dernierCap, etat.vitesseKmh);
+  updateGPSData(etat.derniereLat, etat.derniereLon, etat.dernierCap, etat.vitesseKmh);
 });
 document.getElementById('sim-droite').addEventListener('click', () => {
   etat.dernierCap = normaliserCap(etat.dernierCap + 8);
-  orienterIcone(etat.dernierCap);
-  majBandeau(etat.dernierCap, etat.vitesseKmh);
+  updateGPSData(etat.derniereLat, etat.derniereLon, etat.dernierCap, etat.vitesseKmh);
 });
 document.getElementById('sim-avance').addEventListener('click', () => {
-  const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, 1); // pas d'1 mètre
+  const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, 1);
   updateGPSData(destination.lat, destination.lon, etat.dernierCap, 0);
 });
 
 /* ================================================================
-   8. PANNEAU DE CONFIGURATION — interactions UI
+   8. PANNEAU DE CONFIGURATION
    ================================================================ */
 const panneau = document.getElementById('panneau');
 const voile = document.getElementById('voile');
@@ -630,10 +599,11 @@ majStatutSource();
 majBandeau(etat.dernierCap, etat.vitesseKmh);
 orienterIcone(etat.dernierCap);
 
-// Pour tester immédiatement à l'ouverture du fichier, lance la simulation automatiquement.
-// Commentez la ligne suivante une fois l'ESP32 connecté en production.
+// Démarrage de la boucle de lissage d'animation
+requestAnimationFrame(boucleAnimationFluide);
+
+// Pour tester immédiatement à l'ouverture du fichier.
 demarrerSimulation();
 </script>
 </body>
 </html>
-
