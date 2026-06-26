@@ -1,10 +1,639 @@
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
-    <title>Braud SB35 GPS</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Braud SB35 — Guidage de vendange</title>
+
+<!-- Leaflet.js : cartographie -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Turf.js : disponible si l'on préfère ses fonctions géométriques à la trigonométrie maison (voir commentaires dans le JS) -->
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<style>
+  /* ============================================================
+     1. JETONS DE DESIGN — palette "nuit de vendange"
+     ============================================================ */
+  :root{
+    --bg-deep:      #0B130F;   /* fond général, quasi noir teinté vert sapin */
+    --surface:      #131F19;   /* panneaux, bandeau */
+    --surface-2:    #1B2A22;   /* éléments surélevés (inputs, cartes) */
+    --border:       #2A3B30;
+    --text:         #EAEFE9;
+    --text-dim:     #8FA398;
+    --accent-green: #5FD16B;   /* peinture ON / statut RTK Fix */
+    --accent-green-soft: rgba(95,209,107,0.18);
+    --accent-red:   #E5484D;   /* peinture OFF */
+    --accent-red-soft: rgba(229,72,77,0.18);
+    --accent-amber: #E0A93A;   /* statut RTK Float */
+    --accent-gray:  #6B7670;   /* statut simulation */
+    --font-ui:      -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-mono:    "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{ margin:0; height:100%; background:var(--bg-deep); color:var(--text);
+    font-family:var(--font-ui); overflow:hidden; user-select:none; }
+
+  #carte{ position:absolute; inset:0; z-index:0; background:var(--bg-deep); }
+
+  /* Repère cap (rose des vents minimaliste) sur la carte */
+  .leaflet-control-attribution{ background:rgba(11,19,15,0.6)!important; color:var(--text-dim)!important; font-size:10px; }
+  .leaflet-control-attribution a{ color:var(--text-dim)!important; }
+  .leaflet-control-layers{ background:var(--surface)!important; color:var(--text)!important; border:1px solid var(--border)!important; }
+  .leaflet-control-zoom{ display:none; } /* zoom au doigt (pincer), inutile en cabine */
+
+  /* ============================================================
+     2. BANDEAU SUPÉRIEUR — instruments de bord
+     ============================================================ */
+  #bandeau{
+    position:absolute; top:0; left:0; right:0; z-index:500;
+    display:flex; align-items:stretch; gap:0;
+    background:linear-gradient(180deg, rgba(11,19,15,0.97), rgba(11,19,15,0.85));
+    border-bottom:1px solid var(--border);
+    padding:env(safe-area-inset-top,0) 0 0 0;
+    backdrop-filter:blur(6px);
+  }
+  .instrument{
+    flex:1; display:flex; flex-direction:column; justify-content:center;
+    padding:10px 16px; border-right:1px solid var(--border); min-width:0;
+  }
+  .instrument:last-child{ border-right:none; }
+  .instrument-label{ font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-dim); }
+  .instrument-valeur{ font-family:var(--font-mono); font-size:clamp(18px,3.4vw,26px); font-weight:600; line-height:1.25; }
+  .puce-statut{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+  .puce-statut.fix{ background:var(--accent-green); box-shadow:0 0 8px var(--accent-green); animation:pulse 2s infinite; }
+  .puce-statut.float{ background:var(--accent-amber); box-shadow:0 0 8px var(--accent-amber); }
+  .puce-statut.simu{ background:var(--accent-gray); }
+  .puce-statut.deco{ background:var(--accent-red); }
+  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.45;} }
+
+  #bouton-panneau{
+    flex:0 0 auto; width:56px; display:flex; align-items:center; justify-content:center;
+    border-left:1px solid var(--border); background:transparent; color:var(--text);
+    font-size:22px; cursor:pointer;
+  }
+
+  /* ============================================================
+     3. PANNEAU DE CONFIGURATION — tiroir latéral
+     ============================================================ */
+  #panneau{
+    position:absolute; top:0; right:0; bottom:0; z-index:600;
+    width:min(86vw, 360px);
+    background:var(--surface);
+    border-left:1px solid var(--border);
+    transform:translateX(100%);
+    transition:transform 0.28s ease;
+    overflow-y:auto;
+    padding:18px 18px calc(env(safe-area-inset-bottom,0) + 18px) 18px;
+  }
+  #panneau.ouvert{ transform:translateX(0); }
+  #voile{
+    position:absolute; inset:0; z-index:550; background:rgba(0,0,0,0.45);
+    opacity:0; pointer-events:none; transition:opacity 0.25s ease;
+  }
+  #voile.visible{ opacity:1; pointer-events:auto; }
+
+  .panneau-titre{ font-size:13px; letter-spacing:0.1em; text-transform:uppercase; color:var(--text-dim);
+    margin:22px 0 10px; padding-top:14px; border-top:1px solid var(--border); }
+  .panneau-titre:first-child{ margin-top:0; padding-top:0; border-top:none; }
+
+  .champ{ margin-bottom:14px; }
+  .champ label{ display:block; font-size:13px; color:var(--text-dim); margin-bottom:6px; }
+  .champ input[type="number"], .champ input[type="text"]{
+    width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:10px;
+    color:var(--text); font-family:var(--font-mono); font-size:18px; padding:12px 14px;
+  }
+  .champ input:focus{ outline:2px solid var(--accent-green); outline-offset:1px; }
+
+  .segmente{ display:flex; gap:8px; }
+  .segmente button{
+    flex:1; padding:14px 8px; border-radius:10px; border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text); font-size:15px; font-weight:600; cursor:pointer;
+  }
+  .segmente button.actif{ background:var(--accent-green-soft); border-color:var(--accent-green); color:var(--accent-green); }
+
+  .bouton-secondaire{
+    width:100%; padding:14px; border-radius:10px; border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text); font-size:15px; font-weight:600; cursor:pointer; margin-top:6px;
+  }
+  .bouton-secondaire.alerte{ border-color:var(--accent-red); color:var(--accent-red); }
+
+  /* ============================================================
+     4. COMMANDES DE SIMULATION (mode démo bureau)
+     ============================================================ */
+  #simulation{
+    position:absolute; left:50%; bottom:calc(env(safe-area-inset-bottom,0) + 18px);
+    transform:translateX(-50%); z-index:500;
+    display:flex; gap:10px; align-items:center;
+    background:rgba(19,31,25,0.92); border:1px solid var(--border); border-radius:16px;
+    padding:10px 14px; backdrop-filter:blur(6px);
+  }
+  #simulation button{
+    width:50px; height:50px; border-radius:12px; border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text); font-size:20px; cursor:pointer;
+  }
+  #simulation button#sim-marche{ width:auto; padding:0 16px; font-size:14px; font-weight:700; letter-spacing:0.04em; }
+  #simulation button#sim-marche.actif{ background:var(--accent-green-soft); border-color:var(--accent-green); color:var(--accent-green); }
+
+  /* ============================================================
+     5. GROS BOUTON PEINTURE
+     ============================================================ */
+  #bouton-peinture{
+    position:absolute; right:18px; bottom:calc(env(safe-area-inset-bottom,0) + 18px); z-index:500;
+    width:clamp(108px,22vw,140px); height:clamp(108px,22vw,140px);
+    border-radius:24px; border:2px solid var(--accent-red);
+    background:var(--accent-red-soft); color:var(--accent-red);
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px;
+    font-family:var(--font-ui); font-weight:800; font-size:15px; letter-spacing:0.04em;
+    cursor:pointer; transition:background 0.15s, border-color 0.15s, color 0.15s;
+    box-shadow:0 6px 24px rgba(0,0,0,0.4);
+  }
+  #bouton-peinture.actif{
+    border-color:var(--accent-green); background:var(--accent-green-soft); color:var(--accent-green);
+  }
+  #bouton-peinture .icone-pinceau{ font-size:30px; }
+
+  /* ============================================================
+     6. ICÔNE DE LA MACHINE SUR LA CARTE
+     ============================================================ */
+  .icone-machine{ width:46px; height:46px; transform-origin:50% 50%; pointer-events:none; }
+  .icone-machine svg{ width:100%; height:100%; display:block; filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6)); }
+
+  @media (max-width:480px){
+    .instrument-label{ font-size:9.5px; }
+    .instrument{ padding:8px 10px; }
+  }
+</style>
 </head>
-<body style="background-color: #222; color: white; text-align: center; font-family: sans-serif; padding-top: 50px;">
-    <h1>🍇 Interface Braud SB35 🍇</h1>
-    <p>Le site est en ligne. En attente du code de la carte satellite...</p>
+<body>
+
+<!-- ============================================================
+     CARTE
+     ============================================================ -->
+<div id="carte"></div>
+
+<!-- ============================================================
+     BANDEAU DE DIAGNOSTICS
+     ============================================================ -->
+<div id="bandeau">
+  <div class="instrument">
+    <span class="instrument-label">Statut GPS</span>
+    <span class="instrument-valeur"><span id="puce-statut" class="puce-statut simu"></span><span id="texte-statut">Simulation</span></span>
+  </div>
+  <div class="instrument">
+    <span class="instrument-label">Vitesse</span>
+    <span class="instrument-valeur"><span id="valeur-vitesse">0.0</span> km/h</span>
+  </div>
+  <div class="instrument">
+    <span class="instrument-label">Cap</span>
+    <span class="instrument-valeur"><span id="valeur-cap">0</span>°</span>
+  </div>
+  <button id="bouton-panneau" aria-label="Réglages">⚙</button>
+</div>
+
+<!-- ============================================================
+     VOILE + PANNEAU DE CONFIGURATION
+     ============================================================ -->
+<div id="voile"></div>
+<div id="panneau">
+  <div class="panneau-titre">Tracé de peinture</div>
+
+  <div class="champ">
+    <label for="champ-largeur">Largeur de travail (m)</label>
+    <input type="number" id="champ-largeur" min="0.1" step="0.1" value="2.50">
+  </div>
+
+  <div class="champ">
+    <label for="champ-offset">Déport latéral (m)</label>
+    <input type="number" id="champ-offset" min="0" step="0.1" value="1.20">
+  </div>
+
+  <div class="champ">
+    <label>Côté du déport</label>
+    <div class="segmente">
+      <button id="cote-gauche" data-cote="gauche">◀ Gauche</button>
+      <button id="cote-droite" data-cote="droite" class="actif">Droite ▶</button>
+    </div>
+  </div>
+
+  <button class="bouton-secondaire alerte" id="bouton-effacer">Effacer les tracés</button>
+
+  <div class="panneau-titre">Connexion ESP32 / GNSS</div>
+
+  <div class="champ">
+    <label for="champ-ws">Adresse WebSocket de l'ESP32</label>
+    <input type="text" id="champ-ws" value="ws://192.168.4.1:81">
+  </div>
+  <button class="bouton-secondaire" id="bouton-connexion">Se connecter</button>
+  <div class="champ" style="margin-top:10px;">
+    <label style="margin-bottom:0;">Recentrer la caméra automatiquement</label>
+    <div class="segmente">
+      <button id="suivi-on" data-suivi="1" class="actif">Activé</button>
+      <button id="suivi-off" data-suivi="0">Désactivé</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     COMMANDES DE SIMULATION (mode démo bureau)
+     ============================================================ -->
+<div id="simulation">
+  <button id="sim-gauche" aria-label="Tourner à gauche">↺</button>
+  <button id="sim-marche">▶ AUTO</button>
+  <button id="sim-droite" aria-label="Tourner à droite">↻</button>
+  <button id="sim-avance" aria-label="Avancer d'un pas">⤒</button>
+</div>
+
+<!-- ============================================================
+     GROS BOUTON PEINTURE
+     ============================================================ -->
+<button id="bouton-peinture">
+  <span class="icone-pinceau">🖌</span>
+  <span id="texte-peinture">PEINTURE : OFF</span>
+</button>
+
+<script>
+/* ================================================================
+   ÉTAT GLOBAL DE L'APPLICATION
+   ================================================================ */
+const etat = {
+  derniereLat: 45.1679,          // position de démarrage (vignoble de démonstration, Médoc)
+  derniereLon: -0.7459,
+  dernierCap: 0,
+  vitesseKmh: 0,
+  peintureActive: false,
+  source: 'SIMULATION',          // 'SIMULATION' | 'RTK_FIX' | 'RTK_FLOAT' | 'DECONNECTE'
+  suivreCamera: true,
+  cote: 'droite',                // 'gauche' | 'droite'
+  largeurM: 2.50,
+  offsetM: 1.20,
+  dernierePositionTemps: null
+};
+
+let traceCourante = null;   // tracé en cours d'extension (objet {gauche:[], droite:[], polygone})
+let websocket = null;
+
+/* ================================================================
+   1. INITIALISATION DE LA CARTE LEAFLET
+   ================================================================ */
+const carte = L.map('carte', {
+  zoomControl:false,
+  attributionControl:true,
+  tap:true
+}).setView([etat.derniereLat, etat.derniereLon], 19);
+
+const coucheSatellite = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:21, attribution:'Esri World Imagery' }
+).addTo(carte);
+
+const coucheOSM = L.tileLayer(
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { maxZoom:19, attribution:'© OpenStreetMap' }
+);
+
+L.control.layers({ 'Satellite': coucheSatellite, 'Plan (OSM)': coucheOSM }, {}, { position:'bottomleft' }).addTo(carte);
+
+/* ================================================================
+   2. ICÔNE DE LA MACHINE (silhouette d'enjambeur, vue de dessus)
+   ================================================================ */
+function svgMachine(){
+  return `
+    <svg viewBox="0 0 60 100" xmlns="http://www.w3.org/2000/svg">
+      <g>
+        <!-- Pointe avant : indique le cap -->
+        <polygon points="30,4 40,26 20,26" fill="#5FD16B" />
+        <!-- Corps principal -->
+        <rect x="14" y="24" width="32" height="58" rx="10" fill="#131F19" stroke="#5FD16B" stroke-width="3"/>
+        <!-- Tunnel de secouage (structure qui enjambe le rang) -->
+        <rect x="2" y="40" width="56" height="14" rx="4" fill="#131F19" stroke="#5FD16B" stroke-width="2.5"/>
+        <!-- Point central (axe antenne GNSS) -->
+        <circle cx="30" cy="58" r="4" fill="#5FD16B"/>
+      </g>
+    </svg>`;
+}
+
+const iconeMachine = L.divIcon({
+  className:'icone-machine',
+  html: svgMachine(),
+  iconSize:[46,46],
+  iconAnchor:[23,23]
+});
+
+const marqueurMachine = L.marker([etat.derniereLat, etat.derniereLon], {
+  icon: iconeMachine, interactive:false, keyboard:false
+}).addTo(carte);
+
+// Applique la rotation visuelle au div de l'icône, sans le reconstruire (perf à 10 Hz)
+function orienterIcone(capDeg){
+  const elt = marqueurMachine.getElement();
+  if (elt) elt.style.transform += ` rotate(${capDeg}deg)`;
+  // Note : Leaflet réécrit déjà 'transform' pour le positionnement (translate3d).
+  // On combine donc translation (gérée par Leaflet) + rotation (gérée ici) à chaque trame.
+}
+// Leaflet régénère le style 'transform' à chaque déplacement du marqueur ; on doit
+// donc ré-appliquer la rotation juste après avoir appelé setLatLng (voir updateGPSData).
+
+/* ================================================================
+   3. MATHÉMATIQUES — point de destination par cap + distance
+   ================================================================
+   Formule classique de trigonométrie sphérique (cap + distance -> nouveau point),
+   équivalente à turf.destination(). On la réécrit ici pour rester autonome
+   (utilisable hors-ligne, sans dépendre d'une librairie tierce en cabine).
+*/
+const RAYON_TERRE = 6378137; // mètres (rayon moyen WGS84)
+
+function normaliserCap(deg){
+  return ((deg % 360) + 360) % 360;
+}
+
+function pointDestination(latDeg, lonDeg, capDeg, distanceM){
+  const delta = distanceM / RAYON_TERRE;           // distance angulaire
+  const theta = capDeg * Math.PI / 180;
+  const phi1  = latDeg * Math.PI / 180;
+  const lambda1 = lonDeg * Math.PI / 180;
+
+  const phi2 = Math.asin(
+    Math.sin(phi1) * Math.cos(delta) +
+    Math.cos(phi1) * Math.sin(delta) * Math.cos(theta)
+  );
+  const lambda2 = lambda1 + Math.atan2(
+    Math.sin(theta) * Math.sin(delta) * Math.cos(phi1),
+    Math.cos(delta) - Math.sin(phi1) * Math.sin(phi2)
+  );
+
+  return {
+    lat: phi2 * 180 / Math.PI,
+    lon: (((lambda2 * 180 / Math.PI) + 540) % 360) - 180
+  };
+
+  // Équivalent avec Turf.js, si préféré :
+  // const pt = turf.destination([lonDeg, latDeg], distanceM/1000, capDeg, {units:'kilometers'});
+  // return { lat: pt.geometry.coordinates[1], lon: pt.geometry.coordinates[0] };
+}
+
+/* Calcule le centre du pinceau (décalé du déport) et ses deux bords
+   (gauche/droite, espacés de la largeur de travail), perpendiculaires au cap. */
+function calculerPinceau(latDeg, lonDeg, capDeg, cote, offsetM, largeurM){
+  const capOffset = normaliserCap(cote === 'droite' ? capDeg + 90 : capDeg - 90);
+  const centre = pointDestination(latDeg, lonDeg, capOffset, offsetM);
+
+  const bordGauche = pointDestination(centre.lat, centre.lon, normaliserCap(capDeg - 90), largeurM / 2);
+  const bordDroit  = pointDestination(centre.lat, centre.lon, normaliserCap(capDeg + 90), largeurM / 2);
+
+  return { centre, bordGauche, bordDroit };
+}
+
+/* ================================================================
+   4. GESTION DE LA PEINTURE
+   ================================================================ */
+function demarrerNouveauTrace(){
+  traceCourante = {
+    pointsGauche: [],
+    pointsDroite: [],
+    polygone: L.polygon([], {
+      color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55
+    }).addTo(carte)
+  };
+}
+
+function ajouterPointPeinture(latDeg, lonDeg, capDeg){
+  if (!etat.peintureActive || !traceCourante) return;
+
+  const { bordGauche, bordDroit } = calculerPinceau(
+    latDeg, lonDeg, capDeg, etat.cote, etat.offsetM, etat.largeurM
+  );
+
+  traceCourante.pointsGauche.push([bordGauche.lat, bordGauche.lon]);
+  traceCourante.pointsDroite.push([bordDroit.lat, bordDroit.lon]);
+
+  // Le ruban est formé du bord gauche (dans l'ordre) puis du bord droit (inversé)
+  const ruban = traceCourante.pointsGauche.concat(traceCourante.pointsDroite.slice().reverse());
+  traceCourante.polygone.setLatLngs(ruban);
+}
+
+function definirPeinture(active){
+  etat.peintureActive = active;
+  document.getElementById('bouton-peinture').classList.toggle('actif', active);
+  document.getElementById('texte-peinture').textContent = active ? 'PEINTURE : ON' : 'PEINTURE : OFF';
+  if (active) demarrerNouveauTrace();
+  else traceCourante = null; // le ruban déjà tracé reste affiché ; on arrête juste de l'étendre
+}
+
+document.getElementById('bouton-peinture').addEventListener('click', () => {
+  definirPeinture(!etat.peintureActive);
+});
+
+document.getElementById('bouton-effacer').addEventListener('click', () => {
+  carte.eachLayer(c => { if (c instanceof L.Polygon) carte.removeLayer(c); });
+  traceCourante = null;
+  if (etat.peintureActive) demarrerNouveauTrace();
+});
+
+/* ================================================================
+   5. FONCTION PRINCIPALE — POINT D'ENTRÉE POUR LES DONNÉES GNSS RÉELLES
+   ================================================================
+   >>> C'est ICI que les vraies trames de l'ESP32 (UM982, 10 Hz) doivent
+   >>> être injectées : updateGPSData(latitude, longitude, capDegres, vitesseKmhOptionnelle).
+*/
+function updateGPSData(lat, lon, heading, vitesseKmh){
+  heading = normaliserCap(heading);
+
+  // Vitesse : utilise celle fournie par la trame, sinon la déduit du déplacement
+  const vitesse = (typeof vitesseKmh === 'number')
+    ? vitesseKmh
+    : calculerVitesseDepuisPositions(lat, lon);
+
+  // --- Déplacement du marqueur + orientation ---
+  marqueurMachine.setLatLng([lat, lon]);
+  orienterIcone(heading);
+  if (etat.suivreCamera) carte.panTo([lat, lon], { animate:false });
+
+  // --- Peinture ---
+  ajouterPointPeinture(lat, lon, heading);
+
+  // --- Bandeau de diagnostics ---
+  majBandeau(heading, vitesse);
+
+  // --- Mémorisation pour le prochain calcul de vitesse/temps ---
+  etat.derniereLat = lat;
+  etat.derniereLon = lon;
+  etat.dernierCap = heading;
+  etat.vitesseKmh = vitesse;
+  etat.dernierePositionTemps = performance.now();
+}
+
+function calculerVitesseDepuisPositions(lat, lon){
+  if (etat.dernierePositionTemps === null) return 0;
+  const dtSecondes = (performance.now() - etat.dernierePositionTemps) / 1000;
+  if (dtSecondes <= 0) return etat.vitesseKmh;
+
+  // Distance haversine entre l'ancienne et la nouvelle position
+  const R = RAYON_TERRE;
+  const phi1 = etat.derniereLat * Math.PI/180, phi2 = lat * Math.PI/180;
+  const dPhi = (lat - etat.derniereLat) * Math.PI/180;
+  const dLambda = (lon - etat.derniereLon) * Math.PI/180;
+  const a = Math.sin(dPhi/2)**2 + Math.cos(phi1)*Math.cos(phi2)*Math.sin(dLambda/2)**2;
+  const distanceM = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+  return (distanceM / dtSecondes) * 3.6; // m/s -> km/h
+}
+
+function majBandeau(capDeg, vitesseKmh){
+  document.getElementById('valeur-cap').textContent = Math.round(capDeg);
+  document.getElementById('valeur-vitesse').textContent = vitesseKmh.toFixed(1);
+}
+
+function majStatutSource(){
+  const puce = document.getElementById('puce-statut');
+  const texte = document.getElementById('texte-statut');
+  puce.className = 'puce-statut';
+  switch(etat.source){
+    case 'RTK_FIX':    puce.classList.add('fix');   texte.textContent = 'RTK Fix';     break;
+    case 'RTK_FLOAT':  puce.classList.add('float'); texte.textContent = 'RTK Float';   break;
+    case 'DECONNECTE': puce.classList.add('deco');  texte.textContent = 'Déconnecté';  break;
+    default:           puce.classList.add('simu');  texte.textContent = 'Simulation';
+  }
+}
+
+/* ================================================================
+   6. CONNEXION TEMPS RÉEL À L'ESP32 (WebSocket)
+   ================================================================
+   Trame JSON attendue de l'ESP32, ex. :
+   { "lat":45.1679, "lon":-0.7459, "heading":87.4, "speed":6.2, "fix":"RTK_FIX" }
+*/
+function connecterWebSocket(url){
+  try{
+    websocket = new WebSocket(url);
+
+    websocket.onopen = () => { etat.source = 'RTK_FLOAT'; majStatutSource(); arreterSimulation(); };
+    websocket.onclose = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
+    websocket.onerror = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
+
+    websocket.onmessage = (evenement) => {
+      try{
+        const trame = JSON.parse(evenement.data);
+        if (typeof trame.lat === 'number' && typeof trame.lon === 'number' && typeof trame.heading === 'number'){
+          if (trame.fix) { etat.source = trame.fix; majStatutSource(); }
+          updateGPSData(trame.lat, trame.lon, trame.heading, trame.speed);
+        }
+      }catch(erreur){
+        console.error('Trame JSON invalide reçue de l\'ESP32 :', erreur);
+      }
+    };
+  }catch(erreur){
+    console.error('Connexion WebSocket impossible :', erreur);
+    etat.source = 'DECONNECTE'; majStatutSource();
+  }
+}
+
+/* Alternative par requêtes HTTP (si l'ESP32 expose un serveur REST plutôt qu'un WebSocket) :
+   setInterval(async () => {
+     const reponse = await fetch('http://192.168.4.1/position');
+     const trame = await reponse.json();
+     updateGPSData(trame.lat, trame.lon, trame.heading, trame.speed);
+   }, 100); // 10 Hz
+*/
+
+document.getElementById('bouton-connexion').addEventListener('click', () => {
+  const url = document.getElementById('champ-ws').value.trim();
+  if (url) connecterWebSocket(url);
+});
+
+/* ================================================================
+   7. MODE SIMULATION (test au bureau, sans ESP32)
+   ================================================================ */
+const simulation = { actif:false, intervalle:null, vitesseKmh:5 };
+
+function pasSimulation(){
+  const distanceM = (simulation.vitesseKmh / 3.6) * 0.1; // déplacement en 100 ms (10 Hz)
+  const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, distanceM);
+  updateGPSData(destination.lat, destination.lon, etat.dernierCap, simulation.vitesseKmh);
+}
+
+function demarrerSimulation(){
+  if (simulation.intervalle) return;
+  etat.source = 'SIMULATION'; majStatutSource();
+  simulation.actif = true;
+  simulation.intervalle = setInterval(pasSimulation, 100);
+  document.getElementById('sim-marche').classList.add('actif');
+}
+
+function arreterSimulation(){
+  clearInterval(simulation.intervalle);
+  simulation.intervalle = null;
+  simulation.actif = false;
+  document.getElementById('sim-marche').classList.remove('actif');
+}
+
+document.getElementById('sim-marche').addEventListener('click', () => {
+  simulation.actif ? arreterSimulation() : demarrerSimulation();
+});
+document.getElementById('sim-gauche').addEventListener('click', () => {
+  etat.dernierCap = normaliserCap(etat.dernierCap - 8);
+  orienterIcone(etat.dernierCap);
+  majBandeau(etat.dernierCap, etat.vitesseKmh);
+});
+document.getElementById('sim-droite').addEventListener('click', () => {
+  etat.dernierCap = normaliserCap(etat.dernierCap + 8);
+  orienterIcone(etat.dernierCap);
+  majBandeau(etat.dernierCap, etat.vitesseKmh);
+});
+document.getElementById('sim-avance').addEventListener('click', () => {
+  const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, 1); // pas d'1 mètre
+  updateGPSData(destination.lat, destination.lon, etat.dernierCap, 0);
+});
+
+/* ================================================================
+   8. PANNEAU DE CONFIGURATION — interactions UI
+   ================================================================ */
+const panneau = document.getElementById('panneau');
+const voile = document.getElementById('voile');
+
+function ouvrirPanneau(){ panneau.classList.add('ouvert'); voile.classList.add('visible'); }
+function fermerPanneau(){ panneau.classList.remove('ouvert'); voile.classList.remove('visible'); }
+
+document.getElementById('bouton-panneau').addEventListener('click', ouvrirPanneau);
+voile.addEventListener('click', fermerPanneau);
+
+document.getElementById('champ-largeur').addEventListener('input', (e) => {
+  const v = parseFloat(e.target.value);
+  if (!isNaN(v) && v > 0) etat.largeurM = v;
+});
+document.getElementById('champ-offset').addEventListener('input', (e) => {
+  const v = parseFloat(e.target.value);
+  if (!isNaN(v) && v >= 0) etat.offsetM = v;
+});
+
+function selectionnerCote(cote){
+  etat.cote = cote;
+  document.getElementById('cote-gauche').classList.toggle('actif', cote === 'gauche');
+  document.getElementById('cote-droite').classList.toggle('actif', cote === 'droite');
+}
+document.getElementById('cote-gauche').addEventListener('click', () => selectionnerCote('gauche'));
+document.getElementById('cote-droite').addEventListener('click', () => selectionnerCote('droite'));
+
+function selectionnerSuivi(actif){
+  etat.suivreCamera = actif;
+  document.getElementById('suivi-on').classList.toggle('actif', actif);
+  document.getElementById('suivi-off').classList.toggle('actif', !actif);
+}
+document.getElementById('suivi-on').addEventListener('click', () => selectionnerSuivi(true));
+document.getElementById('suivi-off').addEventListener('click', () => selectionnerSuivi(false));
+
+/* ================================================================
+   9. INITIALISATION
+   ================================================================ */
+majStatutSource();
+majBandeau(etat.dernierCap, etat.vitesseKmh);
+orienterIcone(etat.dernierCap);
+
+// Pour tester immédiatement à l'ouverture du fichier, lance la simulation automatiquement.
+// Commentez la ligne suivante une fois l'ESP32 connecté en production.
+demarrerSimulation();
+</script>
 </body>
 </html>
+
