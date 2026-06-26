@@ -271,10 +271,14 @@ const carte = L.map('carte', {
   attributionControl:true,
   tap:true
 }).setView([etat.derniereLat, etat.derniereLon], 19);
-
+  
 const coucheSatellite = L.tileLayer(
   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-  { maxZoom:21, attribution:'Esri World Imagery' }
+  { 
+    maxZoom: 22, 
+    maxNativeZoom: 18, /* <-- C'EST ÇA LA MAGIE ! */
+    attribution: 'Esri World Imagery' 
+  }
 ).addTo(carte);
 
 const coucheOSM = L.tileLayer(
