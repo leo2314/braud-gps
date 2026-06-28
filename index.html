@@ -182,6 +182,9 @@
   #bouton-peinture.actif{
     border-color:var(--accent-green); background:var(--accent-green-soft); color:var(--accent-green);
   }
+  #bouton-peinture.attente{
+    border-color:var(--accent-amber); background:rgba(224,169,58,0.18); color:var(--accent-amber);
+  }
   #bouton-peinture .icone-pinceau{ font-size:30px; }
 
   /* ============================================================
@@ -189,6 +192,26 @@
      ============================================================ */
   .icone-machine{ width:46px; height:46px; transform-origin:50% 50%; pointer-events:none; }
   .icone-machine svg{ width:100%; height:100%; display:block; filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6)); }
+
+  /* ============================================================
+     6bis. ÉTIQUETTE PERMANENTE DES PARCELLES (nom + surface)
+     ============================================================ */
+  .leaflet-tooltip.label-parcelle{
+    background:rgba(11,19,15,0.78);
+    border:1px solid var(--accent-jaune);
+    color:#FFFFFF;
+    font-family:var(--font-ui);
+    font-size:12px;
+    font-weight:700;
+    letter-spacing:0.01em;
+    padding:4px 9px;
+    border-radius:7px;
+    box-shadow:0 1px 5px rgba(0,0,0,0.5);
+    text-shadow:0 1px 2px rgba(0,0,0,0.85);
+    white-space:nowrap;
+    pointer-events:none;
+  }
+  .leaflet-tooltip.label-parcelle::before{ display:none; } /* pas de petite flèche en direction 'center' */
 
   /* ============================================================
      7. MODE CAVE — masque les commandes réservées au chauffeur
@@ -358,8 +381,10 @@ const lissage = {
 let traceCourante = null;
 let websocket = null;
 let dernierEnvoiPosition = 0;
+let derniereParcelleTrouveeCle = null;      // optimisation 10 Hz : on reteste d'abord la dernière parcelle connue
+let dernierAffichageBoutonPeinture = null;  // 'actif' | 'attente' | null — évite des écritures DOM inutiles à 10 Hz
 const tracesCreesLocalement = new Set(); // évite de redessiner nos propres tracés reçus en écho depuis Firebase
-const parcellesAffichees = {};            // cle Firebase -> { data, calque, pourcentage }
+const parcellesAffichees = {};            // cle Firebase -> { data, calque, etiquette, pourcentage, featureTurf, boite }
 
 /* ================================================================
    1. INITIALISATION DE LA CARTE LEAFLET
@@ -464,18 +489,85 @@ function demarrerNouveauTrace(){
   traceCourante = {
     pointsGauche: [],
     pointsDroite: [],
+    // fillRule:'nonzero' (au lieu du 'evenodd' par défaut du SVG) : l'intérieur du ruban reste
+    // toujours rempli même quand le tracé se recroise lui-même (manœuvres, demi-tours, etc.)
     polygone: L.polygon([], {
-      color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55
+      color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55, fillRule:'nonzero'
     }).addTo(carte)
   };
 }
 
-function ajouterPointPeinture(latDeg, lonDeg, capDeg){
-  if (!etat.peintureActive || !traceCourante) return;
+// Test rapide et peu coûteux : le point est-il dans la boîte englobante de la parcelle ?
+// (filtre avant le test géométrique précis, qui est plus cher à calculer à 10 Hz)
+function dansBoite(lon, lat, boite){
+  return lon >= boite[0] && lon <= boite[2] && lat >= boite[1] && lat <= boite[3];
+}
 
-  const { bordGauche, bordDroit } = calculerPinceau(
+// Recherche la parcelle (s'il y en a une) qui contient le point donné.
+// Optimisation : on reteste d'abord la dernière parcelle trouvée, car la machine y reste
+// statistiquement la plupart du temps — ça évite de scanner toute la liste à chaque trame GPS.
+function trouverParcelleContenant(lat, lon){
+  const point = turf.point([lon, lat]);
+
+  if (derniereParcelleTrouveeCle){
+    const p = parcellesAffichees[derniereParcelleTrouveeCle];
+    if (p && dansBoite(lon, lat, p.boite) && turf.booleanPointInPolygon(point, p.featureTurf)){
+      return derniereParcelleTrouveeCle;
+    }
+  }
+
+  for (const cle of Object.keys(parcellesAffichees)){
+    if (cle === derniereParcelleTrouveeCle) continue; // déjà testée ci-dessus
+    const p = parcellesAffichees[cle];
+    if (!dansBoite(lon, lat, p.boite)) continue;       // hors boîte englobante : on ne va pas plus loin
+    if (turf.booleanPointInPolygon(point, p.featureTurf)){
+      derniereParcelleTrouveeCle = cle;
+      return cle;
+    }
+  }
+
+  derniereParcelleTrouveeCle = null;
+  return null;
+}
+
+// Met à jour l'apparence du gros bouton peinture selon que la machine est dans une parcelle ou non.
+// N'écrit dans le DOM que si l'état affiché change réellement (encore une économie pour la boucle 10 Hz).
+function majBoutonPeintureSelonZone(etatZone){
+  if (!etat.peintureActive) return;
+  if (etatZone === dernierAffichageBoutonPeinture) return;
+  dernierAffichageBoutonPeinture = etatZone;
+
+  const bouton = document.getElementById('bouton-peinture');
+  bouton.classList.toggle('actif', etatZone === 'actif');
+  bouton.classList.toggle('attente', etatZone === 'attente');
+  document.getElementById('texte-peinture').textContent =
+    etatZone === 'actif' ? 'PEINTURE : ON' : 'PEINTURE : EN ATTENTE (HORS ZONE)';
+}
+
+function ajouterPointPeinture(latDeg, lonDeg, capDeg){
+  if (!etat.peintureActive) return;
+
+  // calculerPinceau() donne à la fois le centre décalé (déport) et les deux bords (largeur de travail)
+  const { centre, bordGauche, bordDroit } = calculerPinceau(
     latDeg, lonDeg, capDeg, etat.cote, etat.offsetM, etat.largeurM
   );
+
+  // --- GEOFENCING : on teste la position réelle du pinceau (et non l'antenne GPS), puisque c'est
+  //     elle qui représente l'endroit physiquement peint au sol, déport compris ---
+  const dansUneParcelle = trouverParcelleContenant(centre.lat, centre.lon) !== null;
+
+  if (!dansUneParcelle){
+    // Hors de toute parcelle enregistrée : on gèle le tracé en cours (s'il existe) sans ajouter de point.
+    // finaliserTrace() le clôt proprement (fusion dans la zone récoltée + synchro Firebase) plutôt que
+    // de le laisser ouvert, pour ne jamais tirer un trait droit lors d'une ré-entrée ultérieure.
+    if (traceCourante) finaliserTrace();
+    majBoutonPeintureSelonZone('attente');
+    return;
+  }
+
+  // De retour dans une parcelle : si le tracé avait été figé/clos, on en ouvre un tout nouveau ruban
+  if (!traceCourante) demarrerNouveauTrace();
+  majBoutonPeintureSelonZone('actif');
 
   traceCourante.pointsGauche.push([bordGauche.lat, bordGauche.lon]);
   traceCourante.pointsDroite.push([bordDroit.lat, bordDroit.lon]);
@@ -529,7 +621,10 @@ function finaliserTrace(){
 
 function definirPeinture(active){
   etat.peintureActive = active;
-  document.getElementById('bouton-peinture').classList.toggle('actif', active);
+  dernierAffichageBoutonPeinture = null; // force la prochaine trame GPS à redéterminer l'affichage exact
+  const bouton = document.getElementById('bouton-peinture');
+  bouton.classList.toggle('actif', active);
+  bouton.classList.remove('attente');
   document.getElementById('texte-peinture').textContent = active ? 'PEINTURE : ON' : 'PEINTURE : OFF';
   if (active) demarrerNouveauTrace();
   else finaliserTrace();
@@ -561,21 +656,46 @@ function echapperHTML(texte){
 
 function ajouterOuMajParcelle(cle, data){
   if (!data || !data.geojson) return;
-  if (parcellesAffichees[cle] && parcellesAffichees[cle].calque){
-    carte.removeLayer(parcellesAffichees[cle].calque);
+
+  // On retire l'ancien rendu (contour + étiquette) avant de redessiner, utile en cas de child_changed
+  if (parcellesAffichees[cle]){
+    if (parcellesAffichees[cle].calque) carte.removeLayer(parcellesAffichees[cle].calque);
+    if (parcellesAffichees[cle].etiquette) carte.removeLayer(parcellesAffichees[cle].etiquette);
   }
+
   const calque = L.geoJSON(data.geojson, {
     style:{ color:'#E0C341', weight:1.5, dashArray:'5,6', fill:false, fillOpacity:0, interactive:false }
   }).addTo(carte);
 
+  let featureTurf, boite, centroid;
+  try{
+    featureTurf = turf.feature(data.geojson);
+    boite = turf.bbox(featureTurf);             // [minLon, minLat, maxLon, maxLat] — filtre rapide du geofencing
+    centroid = turf.centroid(featureTurf);       // centre approximatif, pour l'étiquette
+  }catch(erreur){
+    console.error('Parcelle "' + data.nom + '" ignorée (géométrie invalide) :', erreur);
+    carte.removeLayer(calque);
+    return;
+  }
+
+  // --- Étiquette permanente : nom + surface, au centre de la parcelle ---
+  const centreLatLng = [centroid.geometry.coordinates[1], centroid.geometry.coordinates[0]];
+  const etiquette = L.tooltip(centreLatLng, {
+    permanent:true, direction:'center', className:'label-parcelle', interactive:false
+  }).setContent(`${echapperHTML(data.nom)} — ${data.surfaceHa.toFixed(2)} Ha`).addTo(carte);
+
   const pourcentagePrecedent = parcellesAffichees[cle] ? parcellesAffichees[cle].pourcentage : 0;
-  parcellesAffichees[cle] = { data, calque, pourcentage: pourcentagePrecedent };
+  parcellesAffichees[cle] = { data, calque, etiquette, pourcentage: pourcentagePrecedent, featureTurf, boite };
   recalculerPourcentageParcelle(cle);
 }
 
 function supprimerParcelle(cle){
-  if (parcellesAffichees[cle] && parcellesAffichees[cle].calque) carte.removeLayer(parcellesAffichees[cle].calque);
+  if (parcellesAffichees[cle]){
+    if (parcellesAffichees[cle].calque) carte.removeLayer(parcellesAffichees[cle].calque);
+    if (parcellesAffichees[cle].etiquette) carte.removeLayer(parcellesAffichees[cle].etiquette);
+  }
   delete parcellesAffichees[cle];
+  if (derniereParcelleTrouveeCle === cle) derniereParcelleTrouveeCle = null; // évite de référencer une parcelle disparue
   rafraichirListeParcellesUI();
 }
 
@@ -624,7 +744,7 @@ function recalculerPourcentageParcelle(cle){
   let pourcentage = 0;
   if (etat.zoneRecolteTotale){
     try{
-      const featureParcelle = turf.feature(parcelle.data.geojson);
+      const featureParcelle = parcelle.featureTurf || turf.feature(parcelle.data.geojson);
       const intersection = turf.intersect(featureParcelle, etat.zoneRecolteTotale);
       if (intersection){
         const aireParcelle = turf.area(featureParcelle);
@@ -842,7 +962,7 @@ if (firebaseActif){
     const d = snap.val();
     if (!d || !d.geojson) return;
     try{
-      L.geoJSON(d.geojson, { style:{ color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55 } }).addTo(carte);
+      L.geoJSON(d.geojson, { style:{ color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55, fillRule:'nonzero' } }).addTo(carte);
       const feature = turf.feature(d.geojson);
       etat.zoneRecolteTotale = etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, feature) : feature;
       recalculerToutesParcelles();
