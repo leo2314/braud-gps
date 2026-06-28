@@ -7,7 +7,16 @@
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Leaflet-Geoman : dessin des parcelles (polygones) directement sur la carte -->
+<link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />
+<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
+
 <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<!-- Firebase (SDK "compat", v9) : App + Realtime Database -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 
 <style>
   /* ============================================================
@@ -26,6 +35,7 @@
     --accent-red-soft: rgba(229,72,77,0.18);
     --accent-amber: #E0A93A;   /* statut RTK Float */
     --accent-gray:  #6B7670;   /* statut simulation */
+    --accent-jaune: #E0C341;   /* contour des parcelles */
     --font-ui:      -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     --font-mono:    "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
   }
@@ -36,11 +46,20 @@
 
   #carte{ position:absolute; inset:0; z-index:0; background:var(--bg-deep); }
 
-  /* Repère cap (rose des vents minimaliste) sur la carte */
   .leaflet-control-attribution{ background:rgba(11,19,15,0.6)!important; color:var(--text-dim)!important; font-size:10px; }
   .leaflet-control-attribution a{ color:var(--text-dim)!important; }
   .leaflet-control-layers{ background:var(--surface)!important; color:var(--text)!important; border:1px solid var(--border)!important; }
-  .leaflet-control-zoom{ display:none; } /* zoom au doigt (pincer), inutile en cabine */
+  .leaflet-control-zoom{ display:none; }
+
+  /* Surcharges minimales pour intégrer la barre d'outils Leaflet-Geoman au thème sombre.
+     On ne réécrit pas toute la librairie : juste assez pour qu'elle ne jure pas avec l'UI. */
+  .leaflet-pm-toolbar{ margin-top:70px !important; } /* sous le bandeau supérieur */
+  .leaflet-pm-toolbar .leaflet-buttons-control-button{
+    background:var(--surface-2) !important; border:1px solid var(--border) !important; border-radius:8px !important;
+  }
+  .leaflet-pm-toolbar .leaflet-buttons-control-button:hover{ background:var(--accent-green-soft) !important; }
+  .leaflet-pm-actions-container{ background:var(--surface) !important; border:1px solid var(--border) !important; }
+  .leaflet-pm-actions-container a{ color:var(--text) !important; }
 
   /* ============================================================
      2. BANDEAU SUPÉRIEUR — instruments de bord
@@ -59,7 +78,8 @@
   }
   .instrument:last-child{ border-right:none; }
   .instrument-label{ font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-dim); }
-  .instrument-valeur{ font-family:var(--font-mono); font-size:clamp(18px,3.4vw,26px); font-weight:600; line-height:1.25; }
+  .instrument-valeur{ font-family:var(--font-mono); font-size:clamp(18px,3.4vw,26px); font-weight:600; line-height:1.25; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #badge-mode .instrument-valeur{ font-family:var(--font-ui); font-size:clamp(14px,2.6vw,18px); }
   .puce-statut{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; vertical-align:middle; }
   .puce-statut.fix{ background:var(--accent-green); box-shadow:0 0 8px var(--accent-green); animation:pulse 2s infinite; }
   .puce-statut.float{ background:var(--accent-amber); box-shadow:0 0 8px var(--accent-amber); }
@@ -118,6 +138,17 @@
   }
   .bouton-secondaire.alerte{ border-color:var(--accent-red); color:var(--accent-red); }
 
+  /* Liste des parcelles et de leur avancement (visible Chauffeur ET Cave) */
+  #liste-parcelles{ display:flex; flex-direction:column; gap:10px; }
+  .parcelle-vide{ color:var(--text-dim); font-size:13px; margin:0; }
+  .ligne-parcelle{ background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
+  .ligne-parcelle-entete{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .ligne-parcelle-nom{ font-size:14px; font-weight:600; }
+  .ligne-parcelle-pct{ font-family:var(--font-mono); font-size:15px; font-weight:700; flex:0 0 auto; }
+  .ligne-parcelle-barre{ height:5px; border-radius:4px; background:var(--border); margin-top:8px; overflow:hidden; }
+  .ligne-parcelle-remplissage{ height:100%; background:var(--accent-green); transition:width 0.4s ease; }
+  .ligne-parcelle-surface{ margin-top:6px; font-size:12px; color:var(--text-dim); }
+
   /* ============================================================
      4. COMMANDES DE SIMULATION (mode démo bureau)
      ============================================================ */
@@ -159,6 +190,11 @@
   .icone-machine{ width:46px; height:46px; transform-origin:50% 50%; pointer-events:none; }
   .icone-machine svg{ width:100%; height:100%; display:block; filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6)); }
 
+  /* ============================================================
+     7. MODE CAVE — masque les commandes réservées au chauffeur
+     ============================================================ */
+  body.mode-cave .seulement-chauffeur{ display:none !important; }
+
   @media (max-width:480px){
     .instrument-label{ font-size:9.5px; }
     .instrument{ padding:8px 10px; }
@@ -170,6 +206,10 @@
 <div id="carte"></div>
 
 <div id="bandeau">
+  <div class="instrument" id="badge-mode">
+    <span class="instrument-label">Mode</span>
+    <span class="instrument-valeur" id="texte-mode">—</span>
+  </div>
   <div class="instrument">
     <span class="instrument-label">Statut GPS</span>
     <span class="instrument-valeur"><span id="puce-statut" class="puce-statut simu"></span><span id="texte-statut">Simulation</span></span>
@@ -187,70 +227,125 @@
 
 <div id="voile"></div>
 <div id="panneau">
-  <div class="panneau-titre">Tracé de peinture</div>
-  <div class="champ">
-    <label for="champ-largeur">Largeur de travail (m)</label>
-    <input type="number" id="champ-largeur" min="0.1" step="0.1" value="2.50">
-  </div>
-  <div class="champ">
-    <label for="champ-offset">Déport latéral (m)</label>
-    <input type="number" id="champ-offset" min="0" step="0.1" value="1.20">
-  </div>
-  <div class="champ">
-    <label>Côté du déport</label>
-    <div class="segmente">
-      <button id="cote-gauche" data-cote="gauche">◀ Gauche</button>
-      <button id="cote-droite" data-cote="droite" class="actif">Droite ▶</button>
-    </div>
-  </div>
-  <button class="bouton-secondaire alerte" id="bouton-effacer">Effacer les tracés</button>
 
-  <div class="panneau-titre">Connexion ESP32 / GNSS</div>
-  <div class="champ">
-    <label for="champ-ws">Adresse WebSocket de l'ESP32</label>
-    <input type="text" id="champ-ws" value="ws://192.168.4.1:81">
+  <div class="seulement-chauffeur">
+    <div class="panneau-titre">Tracé de peinture</div>
+    <div class="champ">
+      <label for="champ-largeur">Largeur de travail (m)</label>
+      <input type="number" id="champ-largeur" min="0.1" step="0.1" value="2.50">
+    </div>
+    <div class="champ">
+      <label for="champ-offset">Déport latéral (m)</label>
+      <input type="number" id="champ-offset" min="0" step="0.1" value="1.20">
+    </div>
+    <div class="champ">
+      <label>Côté du déport</label>
+      <div class="segmente">
+        <button id="cote-gauche" data-cote="gauche">◀ Gauche</button>
+        <button id="cote-droite" data-cote="droite" class="actif">Droite ▶</button>
+      </div>
+    </div>
+    <button class="bouton-secondaire alerte" id="bouton-effacer">Effacer les tracés</button>
+
+    <div class="panneau-titre">Connexion ESP32 / GNSS</div>
+    <div class="champ">
+      <label for="champ-ws">Adresse WebSocket de l'ESP32</label>
+      <input type="text" id="champ-ws" value="ws://192.168.4.1:81">
+    </div>
+    <button class="bouton-secondaire" id="bouton-connexion">Se connecter</button>
   </div>
-  <button class="bouton-secondaire" id="bouton-connexion">Se connecter</button>
-  <div class="champ" style="margin-top:10px;">
+
+  <div class="panneau-titre">Suivi caméra</div>
+  <div class="champ" style="margin-top:0;">
     <label style="margin-bottom:0;">Recentrer la caméra automatiquement</label>
     <div class="segmente">
       <button id="suivi-on" data-suivi="1" class="actif">Activé</button>
       <button id="suivi-off" data-suivi="0">Désactivé</button>
     </div>
   </div>
+
+  <div class="panneau-titre">Parcelles &amp; avancement</div>
+  <p style="font-size:12px; color:var(--text-dim); margin:-4px 0 12px;" class="seulement-chauffeur">
+    Dessinez un polygone avec l'outil ✏️ en haut à gauche de la carte pour créer une parcelle.
+  </p>
+  <div id="liste-parcelles"><p class="parcelle-vide">Aucune parcelle tracée pour le moment.</p></div>
+
 </div>
 
-<div id="simulation">
+<div id="simulation" class="seulement-chauffeur">
   <button id="sim-gauche" aria-label="Tourner à gauche">↺</button>
   <button id="sim-marche">▶ AUTO</button>
   <button id="sim-droite" aria-label="Tourner à droite">↻</button>
   <button id="sim-avance" aria-label="Avancer d'un pas">⤒</button>
 </div>
 
-<button id="bouton-peinture">
+<button id="bouton-peinture" class="seulement-chauffeur">
   <span class="icone-pinceau">🖌</span>
   <span id="texte-peinture">PEINTURE : OFF</span>
 </button>
 
 <script>
 /* ================================================================
+   0. CONFIGURATION FIREBASE — collez vos propres clés ici
+   ================================================================
+   Console Firebase > Paramètres du projet > Vos applications > SDK (config)
+*/
+const firebaseConfig = {
+  apiKey: "AIzaSyCywa_Qs_1DUo74m0sN6k39tKdK6h08HHs",
+  authDomain: "braud-sb35-gps.firebaseapp.com",
+  databaseURL: "https://braud-sb35-gps-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "braud-sb35-gps",
+  storageBucket: "braud-sb35-gps.firebasestorage.app",
+  messagingSenderId: "687241751580",
+  appId: "1:687241751580:web:d6f137d073890a96d683d9"
+};
+
+
+let firebaseActif = false;
+let db;
+try{
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.database();
+  firebaseActif = true;
+}catch(erreur){
+  console.error('Firebase non initialisé — complétez firebaseConfig ci-dessus :', erreur);
+}
+
+// Références utilisées dans toute l'application (créées seulement si Firebase a démarré)
+let dbMachinePosition, dbMachineConfig, dbParcelles, dbRecolteTraces;
+if (firebaseActif){
+  dbMachinePosition = db.ref('machine/position');
+  dbMachineConfig   = db.ref('machine/config');
+  dbParcelles       = db.ref('parcelles');
+  dbRecolteTraces   = db.ref('recolte/traces');
+}
+
+/* ================================================================
+   DÉTECTION DU MODE DE L'APPAREIL : Chauffeur (par défaut) ou Cave (?mode=cave)
+   ================================================================ */
+const parametresURL = new URLSearchParams(window.location.search);
+const modeCave = parametresURL.get('mode') === 'cave';
+
+/* ================================================================
    ÉTAT GLOBAL DE L'APPLICATION
    ================================================================ */
 const etat = {
-  derniereLat: 47.12237054999479,          
+  modeCave,
+  derniereLat: 47.12237054999479,
   derniereLon: -1.3570622967314048,
   dernierCap: 0,
   vitesseKmh: 0,
   peintureActive: false,
-  source: 'SIMULATION',          
+  source: modeCave ? 'DECONNECTE' : 'SIMULATION',
   suivreCamera: true,
-  cote: 'droite',                
+  cote: 'droite',
   largeurM: 2.50,
   offsetM: 1.20,
-  dernierePositionTemps: null
+  dernierePositionTemps: null,
+  zoneRecolteTotale: null   // union GeoJSON (turf) de toute la surface déjà peinte
 };
 
-// Variables pour le lissage fluide (Interpolation 60 FPS)
+// Variables pour le lissage fluide (Interpolation 60 FPS) — alimentées en local OU depuis Firebase
 const lissage = {
   latCible: 47.12237054999479,
   lonCible: -1.3570622967314048,
@@ -262,6 +357,9 @@ const lissage = {
 
 let traceCourante = null;
 let websocket = null;
+let dernierEnvoiPosition = 0;
+const tracesCreesLocalement = new Set(); // évite de redessiner nos propres tracés reçus en écho depuis Firebase
+const parcellesAffichees = {};            // cle Firebase -> { data, calque, pourcentage }
 
 /* ================================================================
    1. INITIALISATION DE LA CARTE LEAFLET
@@ -271,13 +369,13 @@ const carte = L.map('carte', {
   attributionControl:true,
   tap:true
 }).setView([etat.derniereLat, etat.derniereLon], 19);
-  
+
 const coucheSatellite = L.tileLayer(
   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-  { 
-    maxZoom: 22, 
+  {
+    maxZoom: 22,
     maxNativeZoom: 18, /* <-- C'EST ÇA LA MAGIE ! */
-    attribution: 'Esri World Imagery' 
+    attribution: 'Esri World Imagery'
   }
 ).addTo(carte);
 
@@ -322,7 +420,7 @@ function orienterIcone(capDeg){
 /* ================================================================
    3. MATHÉMATIQUES — point de destination
    ================================================================ */
-const RAYON_TERRE = 6378137; 
+const RAYON_TERRE = 6378137;
 
 function normaliserCap(deg){
   return ((deg % 360) + 360) % 360;
@@ -386,12 +484,55 @@ function ajouterPointPeinture(latDeg, lonDeg, capDeg){
   traceCourante.polygone.setLatLngs(ruban);
 }
 
+// Transforme le ruban [lat,lon] dessiné à l'écran en Polygone GeoJSON (turf), prêt pour union()/intersect()
+function rubanVersGeoJSON(ruban){
+  if (!ruban || ruban.length < 4) return null;
+  const anneau = ruban.map(([lat, lon]) => [lon, lat]); // GeoJSON attend [lon, lat]
+  anneau.push(anneau[0]); // un anneau GeoJSON doit être fermé (premier point = dernier point)
+  try{ return turf.polygon([anneau]); }
+  catch(erreur){ console.error('Anneau de tracé invalide, ignoré :', erreur); return null; }
+}
+
+// Fusionne un nouveau polygone de peinture dans la zone totale déjà récoltée, puis met à jour les % des parcelles
+function fusionnerDansZoneRecolte(polygoneGeoJSON){
+  try{
+    etat.zoneRecolteTotale = etat.zoneRecolteTotale
+      ? turf.union(etat.zoneRecolteTotale, polygoneGeoJSON)
+      : polygoneGeoJSON;
+    recalculerToutesParcelles();
+  }catch(erreur){
+    // Un tracé très tordu (virage très serré) peut produire une géométrie non simple : on l'ignore sans planter.
+    console.error('Fusion de la zone récoltée impossible (tracé trop complexe) :', erreur);
+  }
+}
+
+// Appelée à l'arrêt de la peinture (bouton OFF) : clôt le tracé, l'intègre à la zone récoltée et le synchronise
+function finaliserTrace(){
+  if (!traceCourante){ return; }
+  const ruban = traceCourante.pointsGauche.concat(traceCourante.pointsDroite.slice().reverse());
+  traceCourante = null;
+
+  const polygone = rubanVersGeoJSON(ruban);
+  if (!polygone) return;
+
+  fusionnerDansZoneRecolte(polygone);
+
+  if (firebaseActif && !etat.modeCave){
+    const reference = dbRecolteTraces.push();
+    tracesCreesLocalement.add(reference.key);
+    reference.set({
+      geojson: polygone.geometry,
+      t: firebase.database.ServerValue.TIMESTAMP
+    }).catch(erreur => console.error('Échec de la synchronisation du tracé vers Firebase :', erreur));
+  }
+}
+
 function definirPeinture(active){
   etat.peintureActive = active;
   document.getElementById('bouton-peinture').classList.toggle('actif', active);
   document.getElementById('texte-peinture').textContent = active ? 'PEINTURE : ON' : 'PEINTURE : OFF';
   if (active) demarrerNouveauTrace();
-  else traceCourante = null; 
+  else finaliserTrace();
 }
 
 document.getElementById('bouton-peinture').addEventListener('click', () => {
@@ -401,12 +542,139 @@ document.getElementById('bouton-peinture').addEventListener('click', () => {
 document.getElementById('bouton-effacer').addEventListener('click', () => {
   carte.eachLayer(c => { if (c instanceof L.Polygon) carte.removeLayer(c); });
   traceCourante = null;
+  etat.zoneRecolteTotale = null;
+  recalculerToutesParcelles();
+  if (firebaseActif && !etat.modeCave){
+    dbRecolteTraces.remove().catch(erreur => console.error('Échec de l\'effacement distant des tracés :', erreur));
+  }
   if (etat.peintureActive) demarrerNouveauTrace();
 });
 
 /* ================================================================
-   5. FONCTION PRINCIPALE — POINT D'ENTRÉE GNSS & LISSAGE
+   5. PARCELLES — dessin (Leaflet-Geoman), calcul de surface, synchro Firebase
    ================================================================ */
+function echapperHTML(texte){
+  const d = document.createElement('div');
+  d.textContent = texte;
+  return d.innerHTML;
+}
+
+function ajouterOuMajParcelle(cle, data){
+  if (!data || !data.geojson) return;
+  if (parcellesAffichees[cle] && parcellesAffichees[cle].calque){
+    carte.removeLayer(parcellesAffichees[cle].calque);
+  }
+  const calque = L.geoJSON(data.geojson, {
+    style:{ color:'#E0C341', weight:1.5, dashArray:'5,6', fill:false, fillOpacity:0, interactive:false }
+  }).addTo(carte);
+
+  const pourcentagePrecedent = parcellesAffichees[cle] ? parcellesAffichees[cle].pourcentage : 0;
+  parcellesAffichees[cle] = { data, calque, pourcentage: pourcentagePrecedent };
+  recalculerPourcentageParcelle(cle);
+}
+
+function supprimerParcelle(cle){
+  if (parcellesAffichees[cle] && parcellesAffichees[cle].calque) carte.removeLayer(parcellesAffichees[cle].calque);
+  delete parcellesAffichees[cle];
+  rafraichirListeParcellesUI();
+}
+
+// Outils de dessin Geoman : uniquement côté Chauffeur (la Cave est strictement en lecture)
+if (!etat.modeCave){
+  carte.pm.addControls({
+    position:'topleft',
+    drawMarker:false, drawCircleMarker:false, drawPolyline:false,
+    drawRectangle:false, drawCircle:false, drawText:false,
+    drawPolygon:true, editMode:true, dragMode:false,
+    cutPolygon:false, removalMode:true, rotateMode:false
+  });
+
+  carte.on('pm:create', (evenement) => {
+    if (evenement.shape !== 'Polygon') return;
+    const calqueTemporaire = evenement.layer;
+
+    const nom = window.prompt('Nom de cette parcelle :');
+    if (!nom || !nom.trim()){ carte.removeLayer(calqueTemporaire); return; }
+
+    const geojsonFeature = calqueTemporaire.toGeoJSON();
+    const surfaceM2 = turf.area(geojsonFeature);
+    const surfaceHa = +(surfaceM2 / 10000).toFixed(2); // 1 Ha = 10 000 m²
+
+    carte.removeLayer(calqueTemporaire); // remplacée par le rendu standard (contour jaune) dès la synchro
+
+    const parcelle = { nom: nom.trim(), geojson: geojsonFeature.geometry, surfaceHa };
+
+    if (firebaseActif){
+      const reference = dbParcelles.push();
+      reference.set(parcelle).catch(erreur => console.error('Échec de l\'enregistrement de la parcelle :', erreur));
+    } else {
+      // Pas de Firebase configuré pour l'instant : on affiche quand même la parcelle localement
+      ajouterOuMajParcelle('local-' + Date.now(), parcelle);
+    }
+  });
+}
+
+/* ================================================================
+   6. POURCENTAGE RÉCOLTÉ PAR PARCELLE (turf.intersect / turf.union)
+   ================================================================ */
+function recalculerPourcentageParcelle(cle){
+  const parcelle = parcellesAffichees[cle];
+  if (!parcelle) return;
+
+  let pourcentage = 0;
+  if (etat.zoneRecolteTotale){
+    try{
+      const featureParcelle = turf.feature(parcelle.data.geojson);
+      const intersection = turf.intersect(featureParcelle, etat.zoneRecolteTotale);
+      if (intersection){
+        const aireParcelle = turf.area(featureParcelle);
+        const aireIntersection = turf.area(intersection);
+        pourcentage = aireParcelle > 0 ? Math.min(100, (aireIntersection / aireParcelle) * 100) : 0;
+      }
+    }catch(erreur){
+      console.error('Calcul du pourcentage récolté impossible pour "' + parcelle.data.nom + '" :', erreur);
+    }
+  }
+  parcelle.pourcentage = pourcentage;
+  rafraichirListeParcellesUI();
+}
+
+function recalculerToutesParcelles(){
+  Object.keys(parcellesAffichees).forEach(recalculerPourcentageParcelle);
+}
+
+function rafraichirListeParcellesUI(){
+  const conteneur = document.getElementById('liste-parcelles');
+  const cles = Object.keys(parcellesAffichees);
+
+  if (cles.length === 0){
+    conteneur.innerHTML = '<p class="parcelle-vide">Aucune parcelle tracée pour le moment.</p>';
+    return;
+  }
+
+  conteneur.innerHTML = cles
+    .sort((a, b) => parcellesAffichees[a].data.nom.localeCompare(parcellesAffichees[b].data.nom))
+    .map(cle => {
+      const p = parcellesAffichees[cle];
+      const pct = Math.round(p.pourcentage || 0);
+      return `
+        <div class="ligne-parcelle">
+          <div class="ligne-parcelle-entete">
+            <span class="ligne-parcelle-nom">${echapperHTML(p.data.nom)}</span>
+            <span class="ligne-parcelle-pct">${pct}%</span>
+          </div>
+          <div class="ligne-parcelle-barre"><div class="ligne-parcelle-remplissage" style="width:${Math.min(pct,100)}%"></div></div>
+          <div class="ligne-parcelle-surface">${p.data.surfaceHa.toFixed(2)} Ha — ${pct}% récolté</div>
+        </div>`;
+    }).join('');
+}
+
+/* ================================================================
+   7. FONCTION PRINCIPALE — POINT D'ENTRÉE GNSS & LISSAGE
+   ================================================================
+   >>> En mode Chauffeur, c'est ICI que les vraies trames de l'ESP32 doivent être injectées.
+   >>> En mode Cave, cette même fonction est appelée automatiquement depuis le flux Firebase.
+*/
 function updateGPSData(lat, lon, heading, vitesseKmh){
   heading = normaliserCap(heading);
 
@@ -414,19 +682,17 @@ function updateGPSData(lat, lon, heading, vitesseKmh){
     ? vitesseKmh
     : calculerVitesseDepuisPositions(lat, lon);
 
-  // Stockage des cibles pour le lissage de l'animation
   lissage.latCible = lat;
   lissage.lonCible = lon;
-  
-  // Correction anti-rebond du cap (passage de 359° à 0°)
+
   let diffCap = heading - lissage.capCible;
   if (diffCap > 180) diffCap -= 360;
   if (diffCap < -180) diffCap += 360;
   lissage.capCible = lissage.capCible + diffCap;
 
-  // Calcul et affichage immédiat de la peinture
   ajouterPointPeinture(lat, lon, heading);
   majBandeau(heading, vitesse);
+  envoyerPositionFirebase(lat, lon, heading, vitesse);
 
   etat.derniereLat = lat;
   etat.derniereLon = lon;
@@ -435,10 +701,10 @@ function updateGPSData(lat, lon, heading, vitesseKmh){
   etat.dernierePositionTemps = performance.now();
 }
 
-// === BOUCLE D'ANIMATION (60 FPS) ===
+// === BOUCLE D'ANIMATION (60 FPS) — anime aussi bien les données locales que celles reçues de Firebase ===
 function boucleAnimationFluide() {
   const k = 0.18; // Force du lissage (plus bas = plus fluide mais léger retard)
-  
+
   lissage.latAffichee += (lissage.latCible - lissage.latAffichee) * k;
   lissage.lonAffichee += (lissage.lonCible - lissage.lonAffichee) * k;
   lissage.capAffiche += (lissage.capCible - lissage.capAffiche) * k;
@@ -465,7 +731,7 @@ function calculerVitesseDepuisPositions(lat, lon){
   const a = Math.sin(dPhi/2)**2 + Math.cos(phi1)*Math.cos(phi2)*Math.sin(dLambda/2)**2;
   const distanceM = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 
-  return (distanceM / dtSecondes) * 3.6; 
+  return (distanceM / dtSecondes) * 3.6;
 }
 
 function majBandeau(capDeg, vitesseKmh){
@@ -486,9 +752,11 @@ function majStatutSource(){
 }
 
 /* ================================================================
-   6. CONNEXION TEMPS RÉEL À L'ESP32 (WebSocket)
+   8. CONNEXION TEMPS RÉEL À L'ESP32 (WebSocket) — Mode Chauffeur uniquement
    ================================================================ */
 function connecterWebSocket(url){
+  if (etat.modeCave) return; // la Cave ne se connecte jamais directement à l'ESP32
+
   try{
     websocket = new WebSocket(url);
     websocket.onopen = () => { etat.source = 'RTK_FLOAT'; majStatutSource(); arreterSimulation(); };
@@ -518,18 +786,99 @@ document.getElementById('bouton-connexion').addEventListener('click', () => {
 });
 
 /* ================================================================
-   7. MODE SIMULATION
+   9. SYNCHRONISATION TEMPS RÉEL AVEC FIREBASE
+   ================================================================
+   Chauffeur : ÉCRIT machine/position (continu), machine/config (au changement),
+               parcelles/* (création) et recolte/traces/* (à chaque fin de tracé).
+   Cave      : LIT tout ce qui précède, et ne connaît jamais l'ESP32.
+*/
+function envoyerPositionFirebase(lat, lon, heading, vitesse){
+  if (!firebaseActif || etat.modeCave) return;
+  const maintenant = performance.now();
+  if (maintenant - dernierEnvoiPosition < 120) return; // ~8 envois/s : fluide à la cave, raisonnable pour la RTDB
+  dernierEnvoiPosition = maintenant;
+
+  dbMachinePosition.set({
+    lat, lon, heading, vitesse,
+    peinture: etat.peintureActive,
+    source: etat.source,
+    t: firebase.database.ServerValue.TIMESTAMP
+  }).catch(erreur => console.error('Échec de l\'envoi de la position à Firebase :', erreur));
+}
+
+function envoyerConfigFirebase(){
+  if (!firebaseActif || etat.modeCave) return;
+  dbMachineConfig.set({
+    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote
+  }).catch(erreur => console.error('Échec de l\'envoi de la configuration à Firebase :', erreur));
+}
+
+if (firebaseActif){
+  // --- Parcelles : tous les appareils les téléchargent et les affichent ---
+  dbParcelles.on('child_added',   snap => ajouterOuMajParcelle(snap.key, snap.val()));
+  dbParcelles.on('child_changed', snap => ajouterOuMajParcelle(snap.key, snap.val()));
+  dbParcelles.on('child_removed', snap => supprimerParcelle(snap.key));
+
+  // --- Configuration de la largeur/déport : la Cave doit connaître les mêmes valeurs que le tracteur ---
+  dbMachineConfig.on('value', snap => {
+    const d = snap.val();
+    if (!d) return;
+    if (typeof d.largeurM === 'number') etat.largeurM = d.largeurM;
+    if (typeof d.offsetM === 'number') etat.offsetM = d.offsetM;
+    if (d.cote === 'gauche' || d.cote === 'droite') etat.cote = d.cote;
+
+    const champLargeur = document.getElementById('champ-largeur');
+    const champOffset  = document.getElementById('champ-offset');
+    if (champLargeur) champLargeur.value = etat.largeurM.toFixed(2);
+    if (champOffset)  champOffset.value  = etat.offsetM.toFixed(2);
+    document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
+    document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
+  });
+
+  // --- Historique des tracés de peinture : permet à un appareil qui se connecte en cours de route
+  //     (ou après un rechargement de page) de reconstituer toute la surface déjà récoltée ---
+  dbRecolteTraces.on('child_added', snap => {
+    if (tracesCreesLocalement.has(snap.key)){ tracesCreesLocalement.delete(snap.key); return; }
+    const d = snap.val();
+    if (!d || !d.geojson) return;
+    try{
+      L.geoJSON(d.geojson, { style:{ color:'#5FD16B', weight:0, fillColor:'#5FD16B', fillOpacity:0.55 } }).addTo(carte);
+      const feature = turf.feature(d.geojson);
+      etat.zoneRecolteTotale = etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, feature) : feature;
+      recalculerToutesParcelles();
+    }catch(erreur){
+      console.error('Tracé de récolte distant ignoré (géométrie invalide) :', erreur);
+    }
+  });
+
+  // --- Mode Cave : écoute la position/le cap/l'état de peinture de la machine en direct ---
+  if (etat.modeCave){
+    dbMachinePosition.on('value', snap => {
+      const d = snap.val();
+      if (!d || typeof d.lat !== 'number' || typeof d.lon !== 'number' || typeof d.heading !== 'number') return;
+
+      if (d.source) { etat.source = d.source; majStatutSource(); }
+      if (typeof d.peinture === 'boolean' && d.peinture !== etat.peintureActive){
+        definirPeinture(d.peinture); // reconstitue le même tracé qu'au tracteur, sans jamais réécrire sur Firebase
+      }
+      updateGPSData(d.lat, d.lon, d.heading, d.vitesse);
+    });
+  }
+}
+
+/* ================================================================
+   10. MODE SIMULATION (test au bureau, sans ESP32) — Mode Chauffeur uniquement
    ================================================================ */
 const simulation = { actif:false, intervalle:null, vitesseKmh:5 };
 
 function pasSimulation(){
-  const distanceM = (simulation.vitesseKmh / 3.6) * 0.1; 
+  const distanceM = (simulation.vitesseKmh / 3.6) * 0.1;
   const destination = pointDestination(etat.derniereLat, etat.derniereLon, etat.dernierCap, distanceM);
   updateGPSData(destination.lat, destination.lon, etat.dernierCap, simulation.vitesseKmh);
 }
 
 function demarrerSimulation(){
-  if (simulation.intervalle) return;
+  if (etat.modeCave || simulation.intervalle) return;
   etat.source = 'SIMULATION'; majStatutSource();
   simulation.actif = true;
   simulation.intervalle = setInterval(pasSimulation, 100);
@@ -540,7 +889,8 @@ function arreterSimulation(){
   clearInterval(simulation.intervalle);
   simulation.intervalle = null;
   simulation.actif = false;
-  document.getElementById('sim-marche').classList.remove('actif');
+  const boutonMarche = document.getElementById('sim-marche');
+  if (boutonMarche) boutonMarche.classList.remove('actif');
 }
 
 document.getElementById('sim-marche').addEventListener('click', () => {
@@ -560,7 +910,7 @@ document.getElementById('sim-avance').addEventListener('click', () => {
 });
 
 /* ================================================================
-   8. PANNEAU DE CONFIGURATION
+   11. PANNEAU DE CONFIGURATION
    ================================================================ */
 const panneau = document.getElementById('panneau');
 const voile = document.getElementById('voile');
@@ -573,17 +923,18 @@ voile.addEventListener('click', fermerPanneau);
 
 document.getElementById('champ-largeur').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
-  if (!isNaN(v) && v > 0) etat.largeurM = v;
+  if (!isNaN(v) && v > 0){ etat.largeurM = v; envoyerConfigFirebase(); }
 });
 document.getElementById('champ-offset').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
-  if (!isNaN(v) && v >= 0) etat.offsetM = v;
+  if (!isNaN(v) && v >= 0){ etat.offsetM = v; envoyerConfigFirebase(); }
 });
 
 function selectionnerCote(cote){
   etat.cote = cote;
   document.getElementById('cote-gauche').classList.toggle('actif', cote === 'gauche');
   document.getElementById('cote-droite').classList.toggle('actif', cote === 'droite');
+  envoyerConfigFirebase();
 }
 document.getElementById('cote-gauche').addEventListener('click', () => selectionnerCote('gauche'));
 document.getElementById('cote-droite').addEventListener('click', () => selectionnerCote('droite'));
@@ -597,17 +948,24 @@ document.getElementById('suivi-on').addEventListener('click', () => selectionner
 document.getElementById('suivi-off').addEventListener('click', () => selectionnerSuivi(false));
 
 /* ================================================================
-   9. INITIALISATION
+   12. INITIALISATION
    ================================================================ */
+document.body.classList.toggle('mode-cave', etat.modeCave);
+document.getElementById('texte-mode').textContent = etat.modeCave ? '🍷 Cave' : '🚜 Chauffeur';
+
 majStatutSource();
 majBandeau(etat.dernierCap, etat.vitesseKmh);
 orienterIcone(etat.dernierCap);
+rafraichirListeParcellesUI();
 
-// Démarrage de la boucle de lissage d'animation
+// La boucle de lissage tourne toujours : elle anime aussi bien la simulation locale
+// que les positions reçues de Firebase côté Cave.
 requestAnimationFrame(boucleAnimationFluide);
 
-// Pour tester immédiatement à l'ouverture du fichier.
-demarrerSimulation();
+if (!etat.modeCave){
+  envoyerConfigFirebase(); // initialise machine/config pour que la Cave parte avec les bonnes valeurs
+  demarrerSimulation();    // pour tester immédiatement à l'ouverture du fichier ; à retirer en production
+}
 </script>
 </body>
 </html>
