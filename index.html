@@ -118,6 +118,14 @@
     color:var(--text); font-family:var(--font-mono); font-size:18px; padding:12px 14px;
   }
   .champ input:focus{ outline:2px solid var(--accent-green); outline-offset:1px; }
+  .champ select{
+    width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:10px;
+    color:var(--text); font-family:var(--font-ui); font-size:15px; padding:11px 12px;
+    appearance:none; -webkit-appearance:none;
+  }
+  .champ select:focus{ outline:2px solid var(--accent-green); outline-offset:1px; }
+  .profil-actions{ display:flex; gap:8px; margin-bottom:6px; }
+  .profil-actions .bouton-secondaire{ width:auto; flex:1; margin-top:0; font-size:13px; padding:11px 6px; }
 
   .segmente{ display:flex; gap:8px; }
   .segmente button{
@@ -281,6 +289,7 @@
     <span class="instrument-valeur"><span id="valeur-cap">0</span>°</span>
   </div>
   <button id="bouton-panneau-parcelles" class="bouton-bandeau" aria-label="Parcelles">🗺️</button>
+  <button id="bouton-panneau-statistiques" class="bouton-bandeau" aria-label="Statistiques">📊</button>
   <button id="bouton-panneau" class="bouton-bandeau" aria-label="Réglages">⚙</button>
 </div>
 
@@ -290,6 +299,16 @@
 <div id="panneau-parametres" class="panneau-lateral">
 
   <div class="seulement-chauffeur">
+    <div class="panneau-titre" style="margin-top:0; padding-top:0; border-top:none;">Profil du tracteur</div>
+    <div class="champ">
+      <label for="select-profil">Profil actif</label>
+      <select id="select-profil"></select>
+    </div>
+    <div class="profil-actions">
+      <button class="bouton-secondaire" id="bouton-sauvegarder-profil">💾 Sauvegarder</button>
+      <button class="bouton-secondaire" id="bouton-nouveau-profil">➕ Nouveau profil</button>
+    </div>
+
     <div class="panneau-titre">Tracé de peinture</div>
     <div class="champ">
       <label for="champ-largeur">Largeur de travail (m)</label>
@@ -306,6 +325,11 @@
         <button id="cote-droite" data-cote="droite" class="actif">Droite ▶</button>
       </div>
     </div>
+    <div class="champ">
+      <label for="champ-offset-longitudinal">Déport Avant/Arrière (m)</label>
+      <input type="number" id="champ-offset-longitudinal" step="0.1" value="0">
+    </div>
+    <p style="font-size:11px; color:var(--text-dim); margin:-10px 0 14px;">Positif = vers l'avant · Négatif = vers l'arrière</p>
 
     <div class="panneau-titre">Connexion ESP32 / GNSS</div>
     <div class="champ">
@@ -319,8 +343,8 @@
   <div class="champ" style="margin-top:0;">
     <label style="margin-bottom:0;">Recentrer la caméra automatiquement</label>
     <div class="segmente">
-      <button id="suivi-on" data-suivi="1" class="actif">Activé</button>
-      <button id="suivi-off" data-suivi="0">Désactivé</button>
+      <button id="suivi-on" data-suivi="1">Activé</button>
+      <button id="suivi-off" data-suivi="0" class="actif">Désactivé</button>
     </div>
   </div>
 
@@ -334,6 +358,14 @@
     Dessinez un polygone avec l'outil ✏️ en haut à gauche de la carte pour créer une parcelle.
   </p>
   <div id="liste-parcelles"><p class="parcelle-vide">Aucune parcelle tracée pour le moment.</p></div>
+
+</div>
+
+<!-- PANNEAU 3/3 — Statistiques de récolte regroupées par cépage (visible Chauffeur ET Cave) -->
+<div id="panneau-statistiques" class="panneau-lateral">
+
+  <div class="panneau-titre" style="margin-top:0; padding-top:0; border-top:none;">Statistiques par cépage</div>
+  <div id="liste-statistiques"><p class="parcelle-vide">Aucune parcelle pour le moment.</p></div>
 
 </div>
 
@@ -421,10 +453,11 @@ const etat = {
   vitesseKmh: 0,
   peintureActive: false,
   source: modeCave ? 'DECONNECTE' : 'SIMULATION',
-  suivreCamera: true,
+  suivreCamera: false,
   cote: 'droite',
   largeurM: 2.50,
   offsetM: 1.20,
+  offsetLongitudinalM: 0,   // déport avant (+) / arrière (-), le long de l'axe du cap
   dernierePositionTemps: null,
   zoneRecolteTotale: null   // union GeoJSON (turf) de toute la surface déjà peinte
 };
@@ -538,10 +571,26 @@ function pointDestination(latDeg, lonDeg, capDeg, distanceM){
   };
 }
 
-function calculerPinceau(latDeg, lonDeg, capDeg, cote, offsetM, largeurM){
-  const capOffset = normaliserCap(cote === 'droite' ? capDeg + 90 : capDeg - 90);
-  const centre = pointDestination(latDeg, lonDeg, capOffset, offsetM);
+// Calcule la position du pinceau de peinture à partir de la position GPS brute, en appliquant
+// successivement DEUX déports (la cabine de la Braud SB35 n'est ni centrée, ni à l'aplomb du tunnel) :
+//
+//   Étape A — déport LONGITUDINAL (avant/arrière), le long de l'axe du cap :
+//             positif = vers l'avant (cap exact) ; négatif = vers l'arrière (cap + 180°)
+//   Étape B — déport LATÉRAL (gauche/droite) existant, perpendiculaire au cap, depuis le point intermédiaire
+//   Étape C — bords gauche/droit de la largeur de travail, perpendiculaires au cap, depuis le centre obtenu
+function calculerPinceau(latDeg, lonDeg, capDeg, cote, offsetLateralM, largeurM, offsetLongitudinalM){
+  // --- Étape A : déport longitudinal ---
+  let pointIntermediaire = { lat: latDeg, lon: lonDeg };
+  if (offsetLongitudinalM){
+    const capLongitudinal = normaliserCap(offsetLongitudinalM > 0 ? capDeg : capDeg + 180);
+    pointIntermediaire = pointDestination(latDeg, lonDeg, capLongitudinal, Math.abs(offsetLongitudinalM));
+  }
 
+  // --- Étape B : déport latéral, appliqué depuis le point intermédiaire (et non plus la position GPS brute) ---
+  const capLateral = normaliserCap(cote === 'droite' ? capDeg + 90 : capDeg - 90);
+  const centre = pointDestination(pointIntermediaire.lat, pointIntermediaire.lon, capLateral, offsetLateralM);
+
+  // --- Étape C : bords gauche/droit de la largeur de travail ---
   const bordGauche = pointDestination(centre.lat, centre.lon, normaliserCap(capDeg - 90), largeurM / 2);
   const bordDroit  = pointDestination(centre.lat, centre.lon, normaliserCap(capDeg + 90), largeurM / 2);
 
@@ -614,9 +663,9 @@ function majBoutonPeintureSelonZone(etatZone){
 function ajouterPointPeinture(latDeg, lonDeg, capDeg){
   if (!etat.peintureActive) return;
 
-  // calculerPinceau() donne à la fois le centre décalé (déport) et les deux bords (largeur de travail)
+  // calculerPinceau() donne à la fois le centre décalé (déports latéral+longitudinal) et les deux bords (largeur de travail)
   const { centre, bordGauche, bordDroit } = calculerPinceau(
-    latDeg, lonDeg, capDeg, etat.cote, etat.offsetM, etat.largeurM
+    latDeg, lonDeg, capDeg, etat.cote, etat.offsetM, etat.largeurM, etat.offsetLongitudinalM
   );
 
   // --- GEOFENCING : on teste la position réelle du pinceau (et non l'antenne GPS), puisque c'est
@@ -990,6 +1039,7 @@ function rafraichirListeParcellesUI(){
 
   if (cles.length === 0){
     conteneur.innerHTML = '<p class="parcelle-vide">Aucune parcelle tracée pour le moment.</p>';
+    rafraichirStatistiquesUI();
     return;
   }
 
@@ -1032,6 +1082,56 @@ function rafraichirListeParcellesUI(){
       effacerPeintureParcelle(bouton.getAttribute('data-cle'));
     });
   });
+
+  rafraichirStatistiquesUI();
+}
+
+/* ================================================================
+   6ter. STATISTIQUES PAR CÉPAGE — regroupe toutes les parcelles par cépage
+   ================================================================
+   Réutilise le pourcentage déjà calculé par parcelle (recalculerPourcentageParcelle) :
+   aucun nouveau calcul turf ici, juste une agrégation, donc toujours bon marché à rafraîchir.
+*/
+function calculerStatistiquesCepages(){
+  const groupes = {}; // nom du cépage ('—' si non renseigné) -> { totalHa, recolteHa }
+
+  Object.values(parcellesAffichees).forEach(p => {
+    const cepage = (p.data.cepage && p.data.cepage.trim()) || '—';
+    if (!groupes[cepage]) groupes[cepage] = { totalHa: 0, recolteHa: 0 };
+    groupes[cepage].totalHa += p.data.surfaceHa;
+    groupes[cepage].recolteHa += p.data.surfaceHa * ((p.pourcentage || 0) / 100);
+  });
+
+  return groupes;
+}
+
+function rafraichirStatistiquesUI(){
+  const conteneur = document.getElementById('liste-statistiques');
+  if (!conteneur) return; // sécurité si appelée avant que le DOM du panneau ne soit prêt
+
+  const groupes = calculerStatistiquesCepages();
+  const cepages = Object.keys(groupes);
+
+  if (cepages.length === 0){
+    conteneur.innerHTML = '<p class="parcelle-vide">Aucune parcelle pour le moment.</p>';
+    return;
+  }
+
+  conteneur.innerHTML = cepages
+    .sort((a, b) => a.localeCompare(b))
+    .map(cepage => {
+      const g = groupes[cepage];
+      const pct = g.totalHa > 0 ? Math.min(100, (g.recolteHa / g.totalHa) * 100) : 0;
+      return `
+        <div class="ligne-parcelle">
+          <div class="ligne-parcelle-entete">
+            <span class="ligne-parcelle-nom">${echapperHTML(cepage)}</span>
+            <span class="ligne-parcelle-pct">${Math.round(pct)}%</span>
+          </div>
+          <div class="ligne-parcelle-barre"><div class="ligne-parcelle-remplissage" style="width:${Math.min(pct,100)}%"></div></div>
+          <div class="ligne-parcelle-surface">${g.recolteHa.toFixed(2)} Ha / ${g.totalHa.toFixed(2)} Ha récoltés</div>
+        </div>`;
+    }).join('');
 }
 
 /* ================================================================
@@ -1174,7 +1274,7 @@ function envoyerPositionFirebase(lat, lon, heading, vitesse){
 function envoyerConfigFirebase(){
   if (!firebaseActif || etat.modeCave) return;
   dbMachineConfig.set({
-    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote
+    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote, offsetLongitudinalM: etat.offsetLongitudinalM
   }).catch(erreur => console.error('Échec de l\'envoi de la configuration à Firebase :', erreur));
 }
 
@@ -1191,11 +1291,14 @@ if (firebaseActif){
     if (typeof d.largeurM === 'number') etat.largeurM = d.largeurM;
     if (typeof d.offsetM === 'number') etat.offsetM = d.offsetM;
     if (d.cote === 'gauche' || d.cote === 'droite') etat.cote = d.cote;
+    if (typeof d.offsetLongitudinalM === 'number') etat.offsetLongitudinalM = d.offsetLongitudinalM;
 
     const champLargeur = document.getElementById('champ-largeur');
     const champOffset  = document.getElementById('champ-offset');
+    const champOffsetLongitudinal = document.getElementById('champ-offset-longitudinal');
     if (champLargeur) champLargeur.value = etat.largeurM.toFixed(2);
     if (champOffset)  champOffset.value  = etat.offsetM.toFixed(2);
+    if (champOffsetLongitudinal) champOffsetLongitudinal.value = etat.offsetLongitudinalM.toFixed(2);
     document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
     document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
   });
@@ -1310,26 +1413,28 @@ document.getElementById('sim-avance').addEventListener('click', () => {
 });
 
 /* ================================================================
-   11. PANNEAUX LATÉRAUX — ⚙️ Réglages ET 🗺️ Parcelles (un seul ouvert à la fois)
+   11. PANNEAUX LATÉRAUX — ⚙️ Réglages, 🗺️ Parcelles, 📊 Statistiques (un seul ouvert à la fois)
    ================================================================ */
-const panneauParametres = document.getElementById('panneau-parametres');
-const panneauParcelles  = document.getElementById('panneau-parcelles');
+const panneauParametres    = document.getElementById('panneau-parametres');
+const panneauParcelles     = document.getElementById('panneau-parcelles');
+const panneauStatistiques  = document.getElementById('panneau-statistiques');
+const tousLesPanneaux = [panneauParametres, panneauParcelles, panneauStatistiques];
 const voile = document.getElementById('voile');
 
 function ouvrirPanneau(panneau){
-  // Ferme l'autre tiroir s'il était ouvert : les deux glissent du même côté, ils ne doivent jamais se superposer
-  [panneauParametres, panneauParcelles].forEach(p => { if (p !== panneau) p.classList.remove('ouvert'); });
+  // Ferme les autres tiroirs s'ils étaient ouverts : ils glissent tous du même côté, jamais superposés
+  tousLesPanneaux.forEach(p => { if (p !== panneau) p.classList.remove('ouvert'); });
   panneau.classList.add('ouvert');
   voile.classList.add('visible');
 }
 function fermerPanneaux(){
-  panneauParametres.classList.remove('ouvert');
-  panneauParcelles.classList.remove('ouvert');
+  tousLesPanneaux.forEach(p => p.classList.remove('ouvert'));
   voile.classList.remove('visible');
 }
 
 document.getElementById('bouton-panneau').addEventListener('click', () => ouvrirPanneau(panneauParametres));
 document.getElementById('bouton-panneau-parcelles').addEventListener('click', () => ouvrirPanneau(panneauParcelles));
+document.getElementById('bouton-panneau-statistiques').addEventListener('click', () => ouvrirPanneau(panneauStatistiques));
 voile.addEventListener('click', fermerPanneaux);
 
 document.getElementById('champ-largeur').addEventListener('input', (e) => {
@@ -1339,6 +1444,10 @@ document.getElementById('champ-largeur').addEventListener('input', (e) => {
 document.getElementById('champ-offset').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
   if (!isNaN(v) && v >= 0){ etat.offsetM = v; envoyerConfigFirebase(); }
+});
+document.getElementById('champ-offset-longitudinal').addEventListener('input', (e) => {
+  const v = parseFloat(e.target.value);
+  if (!isNaN(v)){ etat.offsetLongitudinalM = v; envoyerConfigFirebase(); } // pas de borne >=0 : la valeur est signée (avant/arrière)
 });
 
 function selectionnerCote(cote){
@@ -1359,10 +1468,116 @@ document.getElementById('suivi-on').addEventListener('click', () => selectionner
 document.getElementById('suivi-off').addEventListener('click', () => selectionnerSuivi(false));
 
 /* ================================================================
+   11bis. PROFILS DE TRACTEUR — Largeur / Déport latéral / Côté / Déport longitudinal (localStorage)
+   ================================================================
+   Stockage 100% local à l'appareil (chaque tablette/téléphone garde ses propres profils) :
+   ça n'a pas besoin de Firebase, ce sont des réglages MATÉRIELS propres à l'engin utilisé.
+*/
+const CLE_LOCALSTORAGE_PROFILS = 'profilsTracteurs';
+const CLE_LOCALSTORAGE_PROFIL_ACTIF = 'profilTracteurActifNom';
+
+function chargerProfilsTracteurs(){
+  try{
+    const bruts = localStorage.getItem(CLE_LOCALSTORAGE_PROFILS);
+    if (bruts){
+      const profils = JSON.parse(bruts);
+      if (Array.isArray(profils) && profils.length > 0) return profils;
+    }
+  }catch(erreur){
+    console.error('Lecture des profils de tracteur impossible (localStorage) :', erreur);
+  }
+  return null;
+}
+
+function sauvegarderProfilsTracteurs(){
+  try{ localStorage.setItem(CLE_LOCALSTORAGE_PROFILS, JSON.stringify(profilsTracteurs)); }
+  catch(erreur){ console.error('Écriture des profils de tracteur impossible (localStorage) :', erreur); }
+}
+
+// Profil par défaut "Braud SB35", créé une seule fois si l'appareil n'a encore aucun profil enregistré
+const profilsExistants = chargerProfilsTracteurs();
+let profilsTracteurs = profilsExistants || [
+  { nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0 }
+];
+if (!profilsExistants) sauvegarderProfilsTracteurs(); // première utilisation : on persiste le profil par défaut
+
+// On se souvient du dernier profil utilisé sur CET appareil, pour ne pas avoir à le resélectionner à chaque rechargement
+let profilActifNom = localStorage.getItem(CLE_LOCALSTORAGE_PROFIL_ACTIF) || profilsTracteurs[0].nom;
+if (!profilsTracteurs.some(p => p.nom === profilActifNom)) profilActifNom = profilsTracteurs[0].nom; // garde-fou
+
+function rafraichirSelectProfils(){
+  const select = document.getElementById('select-profil');
+  select.innerHTML = profilsTracteurs.map(p =>
+    `<option value="${echapperHTML(p.nom)}"${p.nom === profilActifNom ? ' selected' : ''}>${echapperHTML(p.nom)}</option>`
+  ).join('');
+}
+
+// Charge un profil dans l'état actif de l'application (champs HTML + etat + synchro Firebase)
+function appliquerProfilTracteur(nom){
+  const profil = profilsTracteurs.find(p => p.nom === nom);
+  if (!profil) return;
+
+  profilActifNom = nom;
+  try{ localStorage.setItem(CLE_LOCALSTORAGE_PROFIL_ACTIF, nom); }catch(erreur){ /* pas bloquant */ }
+
+  etat.largeurM = profil.largeurM;
+  etat.offsetM = profil.offsetM;
+  etat.cote = profil.cote;
+  etat.offsetLongitudinalM = profil.offsetLongitudinalM || 0;
+
+  document.getElementById('champ-largeur').value = etat.largeurM.toFixed(2);
+  document.getElementById('champ-offset').value = etat.offsetM.toFixed(2);
+  document.getElementById('champ-offset-longitudinal').value = etat.offsetLongitudinalM.toFixed(2);
+  document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
+  document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
+
+  envoyerConfigFirebase(); // les valeurs du profil deviennent immédiatement actives pour toute la machine
+}
+
+document.getElementById('select-profil').addEventListener('change', (e) => {
+  appliquerProfilTracteur(e.target.value);
+});
+
+// Écrase le profil actif avec les valeurs actuellement réglées (ne crée rien : "Nouveau profil" fait ça)
+document.getElementById('bouton-sauvegarder-profil').addEventListener('click', () => {
+  const profil = profilsTracteurs.find(p => p.nom === profilActifNom);
+  if (!profil) return;
+  profil.largeurM = etat.largeurM;
+  profil.offsetM = etat.offsetM;
+  profil.cote = etat.cote;
+  profil.offsetLongitudinalM = etat.offsetLongitudinalM;
+  sauvegarderProfilsTracteurs();
+  window.alert('Profil « ' + profilActifNom + ' » mis à jour.');
+});
+
+// Crée un nouveau profil à partir des valeurs actuellement réglées, et le sélectionne
+document.getElementById('bouton-nouveau-profil').addEventListener('click', () => {
+  const nom = window.prompt('Nom du nouveau profil :');
+  if (!nom || !nom.trim()) return;
+  const nomFinal = nom.trim();
+
+  if (profilsTracteurs.some(p => p.nom === nomFinal)){
+    window.alert('Un profil porte déjà ce nom.');
+    return;
+  }
+
+  profilsTracteurs.push({
+    nom: nomFinal,
+    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote, offsetLongitudinalM: etat.offsetLongitudinalM
+  });
+  sauvegarderProfilsTracteurs();
+  rafraichirSelectProfils();
+  appliquerProfilTracteur(nomFinal);
+});
+
+/* ================================================================
    12. INITIALISATION
    ================================================================ */
 document.body.classList.toggle('mode-cave', etat.modeCave);
 document.getElementById('texte-mode').textContent = etat.modeCave ? '🍷 Cave' : '🚜 Chauffeur';
+
+rafraichirSelectProfils();
+appliquerProfilTracteur(profilActifNom); // charge largeur/offset/côté/déport longitudinal avant toute autre init
 
 majStatutSource();
 majBandeau(etat.dernierCap, etat.vitesseKmh);
@@ -1375,7 +1590,7 @@ requestAnimationFrame(boucleAnimationFluide);
 
 if (!etat.modeCave){
   envoyerConfigFirebase(); // initialise machine/config pour que la Cave parte avec les bonnes valeurs
-  demarrerSimulation();    // pour tester immédiatement à l'ouverture du fichier ; à retirer en production
+  // demarrerSimulation(); // démarrage désormais statique par défaut — décommenter pour retrouver l'ancien comportement de test
 }
 </script>
 </body>
