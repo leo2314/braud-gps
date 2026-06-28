@@ -139,6 +139,7 @@
     background:var(--surface-2); color:var(--text); font-size:15px; font-weight:600; cursor:pointer; margin-top:6px;
   }
   .bouton-secondaire.alerte{ border-color:var(--accent-red); color:var(--accent-red); }
+  #bouton-gomme-manuelle.actif{ background:var(--accent-red-soft); border-color:var(--accent-red); color:var(--accent-red); }
 
   /* Liste des parcelles et de leur avancement (visible Chauffeur ET Cave) */
   #liste-parcelles{ display:flex; flex-direction:column; gap:10px; }
@@ -353,6 +354,15 @@
 <!-- PANNEAU 2/2 — Gestion des parcelles : liste, cépage, et effacement ciblé de la peinture -->
 <div id="panneau-parcelles" class="panneau-lateral">
 
+  <div class="panneau-titre seulement-chauffeur" style="margin-top:0; padding-top:0; border-top:none;">Outils de nettoyage</div>
+  <div class="champ seulement-chauffeur">
+    <button class="bouton-secondaire" id="bouton-nettoyer-hors-parcelles">🧽 Nettoyer les tracés hors parcelles</button>
+    <button class="bouton-secondaire" id="bouton-gomme-manuelle" style="margin-top:8px;">🧹 Gomme manuelle</button>
+    <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
+      Gomme manuelle : une fois activée, cliquez sur un tracé de peinture sur la carte pour le supprimer entièrement, sans calcul de découpe (utile sur un tracé qui refuse de s'effacer normalement).
+    </p>
+  </div>
+
   <div class="panneau-titre">Parcelles &amp; avancement</div>
   <p style="font-size:12px; color:var(--text-dim); margin:-4px 0 12px;" class="seulement-chauffeur">
     Dessinez un polygone avec l'outil ✏️ en haut à gauche de la carte pour créer une parcelle.
@@ -477,6 +487,7 @@ let websocket = null;
 let dernierEnvoiPosition = 0;
 let derniereParcelleTrouveeCle = null;      // optimisation 10 Hz : on reteste d'abord la dernière parcelle connue
 let dernierAffichageBoutonPeinture = null;  // 'actif' | 'attente' | null — évite des écritures DOM inutiles à 10 Hz
+let modeGommeManuelle = false;              // true = le prochain clic sur un tracé le supprime sans calcul Turf
 const tracesCreesLocalement = new Set(); // évite de redessiner nos propres tracés reçus en écho depuis Firebase
 const tracesParClé = {};                  // cle (Firebase ou locale) -> { feature: Polygone turf, calque: calque Leaflet }
                                            // registre indispensable à l'effacement ciblé par parcelle (turf.difference)
@@ -701,12 +712,72 @@ function rubanVersGeoJSON(ruban){
   catch(erreur){ console.error('Anneau de tracé invalide, ignoré :', erreur); return null; }
 }
 
+// Neutralise les auto-intersections d'un polygone (virages serrés, manœuvres en épingle, demi-tours…)
+// AVANT toute opération booléenne Turf (union/intersect/difference). Sans ça, Turf plante avec une
+// "Topology Error" sur ces géométries non simples — c'est la cause des tracés "indestructibles".
+// L'astuce buffer(0) est une technique SIG classique pour ça (elle repasse par un moteur géométrique
+// robuste — JSTS sous le capot de Turf — qui reconstruit un polygone valide équivalent).
+function nettoyerGeometrie(feature){
+  if (!feature) return null;
+  try{
+    const nettoyee = turf.buffer(feature, 0);
+    return nettoyee || feature; // si le buffer ne renvoie rien d'utilisable, on retombe sur l'original plutôt que de tout perdre
+  }catch(erreur){
+    console.error('Nettoyage de géométrie (turf.buffer 0) impossible, géométrie conservée telle quelle :', erreur);
+    return feature;
+  }
+}
+
+// Style unique pour TOUS les calques de peinture (live, locaux, distants, recréés après découpe...) :
+// avant il existait deux constantes identiques (styleTrace / styleTraceDistante) dans deux fonctions
+// différentes — une seule source de vérité maintenant, plus facile à faire évoluer (ex: la couleur).
+const STYLE_TRACE_PEINTURE = { color:'#0054A6', weight:0, fillColor:'#0054A6', fillOpacity:0.55, fillRule:'nonzero' };
+
+// Crée un calque de peinture standard et y attache l'écouteur de la Gomme Manuelle (section 6quater) :
+// tous les calques de tracé doivent passer par ici pour que la gomme fonctionne sur n'importe lequel d'entre eux.
+function creerCalqueTrace(geometrieOuFeature, cle){
+  const calque = L.geoJSON(geometrieOuFeature, { style: STYLE_TRACE_PEINTURE }).addTo(carte);
+  calque.eachLayer(coucheIndividuelle => {
+    coucheIndividuelle.on('click', (evenement) => {
+      if (!modeGommeManuelle) return;
+      L.DomEvent.stopPropagation(evenement);
+      gommerTraceManuellement(cle);
+    });
+  });
+  return calque;
+}
+
+// Applique le résultat (géométrie découpée, ou null = suppression totale) d'une opération de nettoyage
+// à UN tracé précis : retire/recrée son calque sur la carte, met à jour tracesParClé, puis synchronise
+// Firebase en arrière-plan. Centralise ce qui était dupliqué entre l'effacement par parcelle, le
+// nettoyage "hors parcelles" et la gomme manuelle.
+function appliquerResultatTrace(cle, nouvelleGeometrieOuNull){
+  const trace = tracesParClé[cle];
+  if (trace) carte.removeLayer(trace.calque);
+
+  if (!nouvelleGeometrieOuNull){
+    delete tracesParClé[cle];
+  } else {
+    tracesParClé[cle] = { feature: nouvelleGeometrieOuNull, calque: creerCalqueTrace(nouvelleGeometrieOuNull, cle) };
+  }
+
+  if (!cle.startsWith('local-') && firebaseActif){
+    if (!nouvelleGeometrieOuNull){
+      dbRecolteTraces.child(cle).remove()
+        .catch(erreur => console.error('Échec de la suppression du tracé ' + cle + ' :', erreur));
+    } else {
+      dbRecolteTraces.child(cle).update({ geojson: nouvelleGeometrieOuNull.geometry })
+        .catch(erreur => console.error('Échec de la mise à jour du tracé ' + cle + ' :', erreur));
+    }
+  }
+}
+
 // Fusionne un nouveau polygone de peinture dans la zone totale déjà récoltée, puis met à jour les % des parcelles
 function fusionnerDansZoneRecolte(polygoneGeoJSON){
   try{
-    etat.zoneRecolteTotale = etat.zoneRecolteTotale
-      ? turf.union(etat.zoneRecolteTotale, polygoneGeoJSON)
-      : polygoneGeoJSON;
+    const entree = nettoyerGeometrie(polygoneGeoJSON);
+    const resultat = etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, entree) : entree;
+    etat.zoneRecolteTotale = nettoyerGeometrie(resultat);
     recalculerToutesParcelles();
   }catch(erreur){
     // Un tracé très tordu (virage très serré) peut produire une géométrie non simple : on l'ignore sans planter.
@@ -736,13 +807,10 @@ function finaliserTrace(){
 
   fusionnerDansZoneRecolte(polygone);
 
-  const styleTrace = { color:'#0054A6', weight:0, fillColor:'#0054A6', fillOpacity:0.55, fillRule:'nonzero' };
-
   if (firebaseActif){
     const reference = dbRecolteTraces.push();
     tracesCreesLocalement.add(reference.key);
-    const calque = L.geoJSON(polygone, { style: styleTrace }).addTo(carte);
-    tracesParClé[reference.key] = { feature: polygone, calque };
+    tracesParClé[reference.key] = { feature: polygone, calque: creerCalqueTrace(polygone, reference.key) };
     reference.set({
       geojson: polygone.geometry,
       t: firebase.database.ServerValue.TIMESTAMP
@@ -750,8 +818,7 @@ function finaliserTrace(){
   } else {
     // Pas de Firebase configuré : le tracé reste local, sous une clé interne (non synchronisée)
     const cleLocale = 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-    const calque = L.geoJSON(polygone, { style: styleTrace }).addTo(carte);
-    tracesParClé[cleLocale] = { feature: polygone, calque };
+    tracesParClé[cleLocale] = { feature: polygone, calque: creerCalqueTrace(polygone, cleLocale) };
   }
 }
 
@@ -788,9 +855,18 @@ function ajouterOuMajParcelle(cle, data){
     if (parcellesAffichees[cle].etiquette) carte.removeLayer(parcellesAffichees[cle].etiquette);
   }
 
+  // interactive:true (et non plus false) : indispensable pour que Leaflet-Geoman puisse accrocher
+  // des poignées d'édition sur ce contour quand le Chauffeur active le mode "Éditer" de la carte.
   const calque = L.geoJSON(data.geojson, {
-    style:{ color:'#E0C341', weight:1.5, dashArray:'5,6', fill:false, fillOpacity:0, interactive:false }
+    style:{ color:'#E0C341', weight:1.5, dashArray:'5,6', fill:false, fillOpacity:0, interactive:true }
   }).addTo(carte);
+
+  // Recalcule la superficie (et synchronise Firebase) si l'utilisateur déplace un sommet de cette parcelle
+  if (!etat.modeCave){
+    calque.eachLayer(coucheIndividuelle => {
+      coucheIndividuelle.on('pm:edit', () => gererEditionParcelle(cle, coucheIndividuelle));
+    });
+  }
 
   let featureTurf, boite, centroid;
   try{
@@ -931,6 +1007,56 @@ if (!etat.modeCave){
     cleParcelleEnEdition = null;
     ouvrirModaleParcelle('Nouvelle parcelle', '', '');
   });
+
+  // Filet de sécurité : 'pm:update' est l'événement global (sur la carte) que Geoman déclenche pour
+  // TOUTE modification de forme (édition de sommet, glissé, rotation, découpe...). On le branche en
+  // complément du 'pm:edit' déjà posé par-couche dans ajouterOuMajParcelle, au cas où une de ces
+  // interactions ne déclencherait pas 'pm:edit' selon la version de Geoman installée.
+  carte.on('pm:update', (evenement) => {
+    if (!evenement || !evenement.layer) return;
+    const cleTrouvee = Object.keys(parcellesAffichees).find(cle => {
+      const calque = parcellesAffichees[cle].calque;
+      return calque && typeof calque.hasLayer === 'function' && calque.hasLayer(evenement.layer);
+    });
+    if (cleTrouvee) gererEditionParcelle(cleTrouvee, evenement.layer);
+  });
+}
+
+// Appelée après l'édition des sommets d'une parcelle (pm:edit / pm:update) : recalcule turf.area(),
+// met à jour Firebase (nom et cépage conservés), ce qui déclenchera à son tour la mise à jour des
+// statistiques et des étiquettes via l'écouteur child_changed déjà en place sur dbParcelles.
+function gererEditionParcelle(cle, coucheEditee){
+  if (etat.modeCave) return; // lecture seule : ne devrait jamais être atteint, garde-fou par cohérence avec le reste du code
+
+  const parcelle = parcellesAffichees[cle];
+  if (!parcelle) return;
+
+  let nouvelleGeoJSON;
+  try{
+    nouvelleGeoJSON = coucheEditee.toGeoJSON();
+  }catch(erreur){
+    console.error('Lecture de la géométrie éditée impossible, parcelle non mise à jour :', erreur);
+    return;
+  }
+
+  let surfaceHa;
+  try{
+    surfaceHa = +(turf.area(nouvelleGeoJSON) / 10000).toFixed(2);
+  }catch(erreur){
+    console.error('Calcul de surface impossible après édition, parcelle non mise à jour :', erreur);
+    return;
+  }
+
+  const donneesMaj = { nom: parcelle.data.nom, cepage: parcelle.data.cepage, geojson: nouvelleGeoJSON.geometry, surfaceHa };
+
+  if (firebaseActif && !cle.startsWith('local-')){
+    dbParcelles.child(cle).update({ geojson: donneesMaj.geojson, surfaceHa })
+      .catch(erreur => console.error('Échec de la synchronisation de la parcelle éditée :', erreur));
+    // La carte, le %, les statistiques et l'étiquette se rafraîchiront via child_changed -> ajouterOuMajParcelle
+  } else {
+    // Pas de Firebase (ou parcelle purement locale) : on applique nous-mêmes le changement
+    ajouterOuMajParcelle(cle, donneesMaj);
+  }
 }
 
 /* ================================================================
@@ -943,7 +1069,7 @@ function recalculerPourcentageParcelle(cle){
   let pourcentage = 0;
   if (etat.zoneRecolteTotale){
     try{
-      const featureParcelle = parcelle.featureTurf || turf.feature(parcelle.data.geojson);
+      const featureParcelle = nettoyerGeometrie(parcelle.featureTurf || turf.feature(parcelle.data.geojson));
       const intersection = turf.intersect(featureParcelle, etat.zoneRecolteTotale);
       if (intersection){
         const aireParcelle = turf.area(featureParcelle);
@@ -972,15 +1098,25 @@ function recalculerToutesParcelles(){
 function reconstruireZoneRecolteTotale(){
   let zone = null;
   for (const cle of Object.keys(tracesParClé)){
-    zone = zone ? turf.union(zone, tracesParClé[cle].feature) : tracesParClé[cle].feature;
+    try{
+      const entree = nettoyerGeometrie(tracesParClé[cle].feature);
+      zone = zone ? turf.union(zone, entree) : entree;
+    }catch(erreur){
+      console.error('Tracé ' + cle + ' ignoré lors de la reconstruction de la zone récoltée :', erreur);
+    }
   }
-  etat.zoneRecolteTotale = zone;
+  etat.zoneRecolteTotale = zone ? nettoyerGeometrie(zone) : null;
 }
 
 // Efface uniquement la portion de peinture contenue dans la parcelle "cleParcelle".
 // Parcourt l'historique des tracés (tracesParClé) et, pour chacun touchant la parcelle,
 // le découpe avec turf.difference (= "ce tracé moins la parcelle"). Un tracé entièrement
 // contenu dans la parcelle est supprimé ; un tracé qui ne fait que la traverser est raccourci.
+//
+// IMPORTANT (correctif bug "% figé") : la carte, tracesParClé ET le % affiché sont recalculés
+// IMMÉDIATEMENT ici, en local — on ne dépend plus uniquement du round-trip Firebase (child_changed/
+// child_removed) pour ça. Ce round-trip reste utile pour propager le changement aux AUTRES appareils
+// (Cave, autre tablette), mais ce n'est plus le seul chemin qui fait retomber le % à 0 sur CET appareil.
 function effacerPeintureParcelle(cleParcelle){
   if (etat.modeCave) return; // la Cave ne déclenche jamais d'effacement (lecture seule)
 
@@ -990,48 +1126,116 @@ function effacerPeintureParcelle(cleParcelle){
   const confirmation = window.confirm('Êtes-vous sûr de vouloir effacer toute la peinture de cette parcelle ?');
   if (!confirmation) return;
 
-  const parcelleFeature = parcelle.featureTurf;
-  const styleTrace = { color:'#0054A6', weight:0, fillColor:'#0054A6', fillOpacity:0.55, fillRule:'nonzero' };
+  const parcelleFeature = nettoyerGeometrie(parcelle.featureTurf);
 
   Object.keys(tracesParClé).forEach(cle => {
     const trace = tracesParClé[cle];
-    let nouvelleGeometrie;
+    const traceNettoyee = nettoyerGeometrie(trace.feature);
+    if (!traceNettoyee) return;
 
+    let nouvelleGeometrie;
     try{
-      if (!turf.intersect(trace.feature, parcelleFeature)) return; // ce tracé ne touche pas la parcelle : on ne le touche pas
-      nouvelleGeometrie = turf.difference(trace.feature, parcelleFeature); // portion du tracé restant HORS parcelle
+      if (!turf.intersect(traceNettoyee, parcelleFeature)) return; // ce tracé ne touche pas la parcelle : on ne le touche pas
+      nouvelleGeometrie = turf.difference(traceNettoyee, parcelleFeature); // portion du tracé restant HORS parcelle
     }catch(erreur){
       console.error('Découpe impossible pour le tracé ' + cle + ', il est conservé tel quel :', erreur);
       return;
     }
 
-    if (cle.startsWith('local-')){
-      // Tracé purement local (pas de Firebase) : mise à jour directe en mémoire et à l'écran
-      carte.removeLayer(trace.calque);
-      if (!nouvelleGeometrie){
-        delete tracesParClé[cle];
-      } else {
-        tracesParClé[cle] = { feature: nouvelleGeometrie, calque: L.geoJSON(nouvelleGeometrie, { style: styleTrace }).addTo(carte) };
-      }
-    } else if (firebaseActif){
-      // Tracé synchronisé : on écrit le résultat sur Firebase. C'est l'écouteur child_changed/child_removed
-      // (déjà en place) qui se chargera de mettre à jour la carte et le pourcentage — ici comme à la Cave.
-      if (!nouvelleGeometrie){
-        dbRecolteTraces.child(cle).remove()
-          .catch(erreur => console.error('Échec de la suppression du tracé ' + cle + ' :', erreur));
-      } else {
-        dbRecolteTraces.child(cle).update({ geojson: nouvelleGeometrie.geometry })
-          .catch(erreur => console.error('Échec de la mise à jour du tracé découpé ' + cle + ' :', erreur));
-      }
+    appliquerResultatTrace(cle, nouvelleGeometrie);
+  });
+
+  // Recalcul LOCAL immédiat et inconditionnel — corrige le bug où le % restait figé en attendant Firebase
+  reconstruireZoneRecolteTotale();
+  recalculerToutesParcelles();
+}
+
+/* ================================================================
+   6ter. NETTOYAGE DES TRACÉS HORS PARCELLES
+   ================================================================ */
+// Calcule l'union de TOUTES les parcelles connues, puis ne garde de chaque tracé que sa portion
+// qui chevauche au moins une parcelle (turf.intersect) — tout le reste (tracé "dans le vide") est
+// supprimé/raccourci définitivement, sur Firebase comme sur la carte.
+function nettoyerTracesHorsParcelles(){
+  if (etat.modeCave) return;
+
+  const clesParcelles = Object.keys(parcellesAffichees);
+  if (clesParcelles.length === 0){
+    window.alert('Aucune parcelle enregistrée : impossible de déterminer ce qui est "hors parcelle".');
+    return;
+  }
+
+  const confirmation = window.confirm('Supprimer définitivement toute la peinture située hors de toute parcelle ?');
+  if (!confirmation) return;
+
+  // Union de toutes les parcelles, nettoyée pour limiter les erreurs de topologie
+  let unionParcelles = null;
+  clesParcelles.forEach(cle => {
+    const f = nettoyerGeometrie(parcellesAffichees[cle].featureTurf);
+    if (!f) return;
+    try{
+      unionParcelles = unionParcelles ? turf.union(unionParcelles, f) : f;
+    }catch(erreur){
+      console.error('Parcelle ' + cle + ' ignorée lors du calcul de l\'union des parcelles :', erreur);
     }
   });
 
-  // Sans Firebase, les écouteurs child_changed/child_removed ne se déclenchent jamais : on recalcule ici.
-  if (!firebaseActif){
-    reconstruireZoneRecolteTotale();
-    recalculerToutesParcelles();
+  if (!unionParcelles){
+    window.alert('Impossible de calculer la zone des parcelles, opération annulée.');
+    return;
   }
+  unionParcelles = nettoyerGeometrie(unionParcelles);
+
+  Object.keys(tracesParClé).forEach(cle => {
+    const traceNettoyee = nettoyerGeometrie(tracesParClé[cle].feature);
+    if (!traceNettoyee) return;
+
+    let portionDansParcelles; // = la partie du tracé qu'on GARDE (celle qui chevauche au moins une parcelle)
+    try{
+      portionDansParcelles = turf.intersect(traceNettoyee, unionParcelles);
+    }catch(erreur){
+      console.error('Tracé ' + cle + ' conservé tel quel (erreur de calcul) :', erreur);
+      return;
+    }
+
+    appliquerResultatTrace(cle, portionDansParcelles);
+  });
+
+  reconstruireZoneRecolteTotale();
+  recalculerToutesParcelles();
+  window.alert('Nettoyage des tracés hors parcelles terminé.');
 }
+
+/* ================================================================
+   6quater. GOMME MANUELLE — suppression directe d'un tracé, sans aucun calcul Turf
+   ================================================================ */
+// Pour les tracés "indestructibles" : on les supprime entièrement, en se passant complètement
+// de turf.difference/intersect (donc impossible que ça plante, peu importe la géométrie d'origine).
+function activerGommeManuelle(){
+  modeGommeManuelle = true;
+  carte.getContainer().style.cursor = 'crosshair';
+  const bouton = document.getElementById('bouton-gomme-manuelle');
+  if (bouton) bouton.classList.add('actif');
+}
+function desactiverGommeManuelle(){
+  modeGommeManuelle = false;
+  carte.getContainer().style.cursor = '';
+  const bouton = document.getElementById('bouton-gomme-manuelle');
+  if (bouton) bouton.classList.remove('actif');
+}
+
+function gommerTraceManuellement(cle){
+  if (!tracesParClé[cle]) return;
+  appliquerResultatTrace(cle, null); // null = suppression totale, sans découpe
+  reconstruireZoneRecolteTotale();
+  recalculerToutesParcelles();
+  desactiverGommeManuelle(); // usage unique : on désarme la gomme après chaque suppression
+}
+
+document.getElementById('bouton-gomme-manuelle').addEventListener('click', () => {
+  modeGommeManuelle ? desactiverGommeManuelle() : activerGommeManuelle();
+});
+document.getElementById('bouton-nettoyer-hors-parcelles').addEventListener('click', nettoyerTracesHorsParcelles);
 
 function rafraichirListeParcellesUI(){
   const conteneur = document.getElementById('liste-parcelles');
@@ -1308,17 +1512,15 @@ if (firebaseActif){
   //     child_changed/child_removed sont indispensables à l'effacement ciblé par parcelle (cf. section 6bis) :
   //     c'est par ces deux événements que la Cave (et tous les autres appareils) voient une parcelle
   //     redevenir vierge, exactement comme le Chauffeur qui a déclenché l'effacement. ---
-  const styleTraceDistante = { color:'#0054A6', weight:0, fillColor:'#0054A6', fillOpacity:0.55, fillRule:'nonzero' };
-
   dbRecolteTraces.on('child_added', snap => {
     if (tracesCreesLocalement.has(snap.key)){ tracesCreesLocalement.delete(snap.key); return; }
     const d = snap.val();
     if (!d || !d.geojson) return;
     try{
       const feature = turf.feature(d.geojson);
-      const calque = L.geoJSON(d.geojson, { style: styleTraceDistante }).addTo(carte);
-      tracesParClé[snap.key] = { feature, calque };
-      etat.zoneRecolteTotale = etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, feature) : feature;
+      tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key) };
+      const entree = nettoyerGeometrie(feature);
+      etat.zoneRecolteTotale = nettoyerGeometrie(etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, entree) : entree);
       recalculerToutesParcelles();
     }catch(erreur){
       console.error('Tracé de récolte distant ignoré (géométrie invalide) :', erreur);
@@ -1334,8 +1536,7 @@ if (firebaseActif){
     if (d && d.geojson){
       try{
         const feature = turf.feature(d.geojson);
-        const calque = L.geoJSON(d.geojson, { style: styleTraceDistante }).addTo(carte);
-        tracesParClé[snap.key] = { feature, calque };
+        tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key) };
       }catch(erreur){
         console.error('Mise à jour de tracé ignorée (géométrie invalide) :', erreur);
       }
