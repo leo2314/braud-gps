@@ -83,6 +83,8 @@
   .puce-statut{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; vertical-align:middle; }
   .puce-statut.fix{ background:var(--accent-green); box-shadow:0 0 8px var(--accent-green); animation:pulse 2s infinite; }
   .puce-statut.float{ background:var(--accent-amber); box-shadow:0 0 8px var(--accent-amber); }
+  .puce-statut.single{ background:#3B82F6; box-shadow:0 0 8px #3B82F6; }   /* GPS Single (qualité 1) */
+  .puce-statut.dgps{ background:#818CF8; box-shadow:0 0 8px #818CF8; }     /* DGPS         (qualité 2) */
   .puce-statut.simu{ background:var(--accent-gray); }
   .puce-statut.deco{ background:var(--accent-red); }
   @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.45;} }
@@ -280,6 +282,10 @@
   <div class="instrument">
     <span class="instrument-label">Statut GPS</span>
     <span class="instrument-valeur"><span id="puce-statut" class="puce-statut simu"></span><span id="texte-statut">Simulation</span></span>
+  </div>
+  <div class="instrument">
+    <span class="instrument-label">Satellites</span>
+    <span class="instrument-valeur"><span id="valeur-satellites">—</span></span>
   </div>
   <div class="instrument">
     <span class="instrument-label">Vitesse</span>
@@ -1350,16 +1356,17 @@ function rafraichirStatistiquesUI(){
    >>> En mode Cave, cette même fonction est appelée automatiquement depuis le flux Firebase.
 */
 // Convertit la valeur brute du champ "rtk" de l'ESP32 vers l'une des clés reconnues par majStatutSource().
-// L'ESP32 peut envoyer un entier (standard NMEA : 1=GPS, 4=RTK Fix, 5=RTK Float)
-// ou directement une chaîne lisible ('RTK_FIX', 'RTK_FLOAT', 'SIMULATION'…).
+// L'ESP32 envoie la valeur GGA brute (entier NMEA) depuis lireStatutRtk() sans aucun filtre.
+// L'interface peut aussi recevoir une chaîne si elle vient de la simulation ou d'un appareil plus ancien.
 function mapperStatutRTK(rtk){
-  if (typeof rtk === 'string') return rtk; // déjà dans le bon format
+  if (typeof rtk === 'string') return rtk; // déjà dans le bon format (simulation, rétrocompatibilité)
   if (typeof rtk === 'number'){
-    if (rtk === 4) return 'RTK_FIX';
-    if (rtk === 5) return 'RTK_FLOAT';
-    if (rtk === 1 || rtk === 2) return 'RTK_FLOAT'; // précision intermédiaire
+    if (rtk === 4) return 'RTK_FIX';    // RTK Fixed : précision centimétrique
+    if (rtk === 5) return 'RTK_FLOAT';  // RTK Float : précision décimétrique
+    if (rtk === 2) return 'DGPS';       // DGPS / SBAS
+    if (rtk === 1) return 'SINGLE';     // GPS Single (autonome, pas de correction)
   }
-  return 'DECONNECTE';
+  return 'DECONNECTE'; // 0 ou valeur inconnue
 }
 
 /* ================================================================
@@ -1368,21 +1375,29 @@ function mapperStatutRTK(rtk){
    En mode Cave ET Chauffeur réel : appelée par l'écouteur Firebase (/machine/position).
    ----------------------------------------------------------------
    Paramètres :
-     lat, lon       — coordonnées WGS84 (nombres)
-     heading        — cap en degrés 0-360 (nombres)
-     vitesseKmh     — vitesse en km/h (nombre ou undefined → calculée par haversine)
-     rtk            — statut RTK brut de l'ESP32 (number ou string, optionnel)
-     _depuisFirebase— flag INTERNE : true si l'appel vient de l'écouteur Firebase,
-                      pour éviter que updateGPSData ne réécrive sur Firebase
-                      ce qu'il vient d'en lire (boucle infinie).
+     lat, lon        — coordonnées WGS84 (nombres)
+     heading         — cap en degrés 0-360 (nombre)
+     vitesseKmh      — vitesse en km/h (nombre ou undefined → calculée par haversine)
+     rtk             — statut RTK brut de l'ESP32 (number NMEA ou string, optionnel)
+     _depuisFirebase — flag INTERNE : true si l'appel vient de l'écouteur Firebase,
+                       pour éviter que updateGPSData ne réécrive sur Firebase
+                       ce qu'il vient d'en lire (boucle infinie).
+     satellites      — nombre de satellites utilisés (entier, optionnel). Si absent
+                       (ex: simulation locale), la valeur affichée n'est pas modifiée.
 */
-function updateGPSData(lat, lon, heading, vitesseKmh, rtk, _depuisFirebase){
+function updateGPSData(lat, lon, heading, vitesseKmh, rtk, _depuisFirebase, satellites){
   heading = normaliserCap(heading);
 
   // Mise à jour du statut RTK dans le bandeau si fourni
   if (rtk !== undefined && rtk !== null){
     etat.source = mapperStatutRTK(rtk);
     majStatutSource();
+  }
+
+  // Mise à jour du nombre de satellites si fourni (undefined = on ne touche pas l'affichage)
+  if (satellites !== undefined && satellites !== null){
+    const eltSat = document.getElementById('valeur-satellites');
+    if (eltSat) eltSat.textContent = satellites > 0 ? satellites : '—';
   }
 
   const vitesse = (typeof vitesseKmh === 'number')
@@ -1453,21 +1468,22 @@ function majStatutSource(){
   const texte = document.getElementById('texte-statut');
   puce.className = 'puce-statut';
   switch(etat.source){
-    case 'RTK_FIX':    puce.classList.add('fix');   texte.textContent = 'RTK Fix';     break;
-    case 'RTK_FLOAT':  puce.classList.add('float'); texte.textContent = 'RTK Float';   break;
-    case 'DECONNECTE': puce.classList.add('deco');  texte.textContent = 'Déconnecté';  break;
-    default:           puce.classList.add('simu');  texte.textContent = 'Simulation';
+    case 'RTK_FIX':    puce.classList.add('fix');    texte.textContent = 'RTK Fix';    break;
+    case 'RTK_FLOAT':  puce.classList.add('float');  texte.textContent = 'RTK Float';  break;
+    case 'SINGLE':     puce.classList.add('single'); texte.textContent = 'GPS Single'; break;
+    case 'DGPS':       puce.classList.add('dgps');   texte.textContent = 'DGPS';       break;
+    case 'DECONNECTE': puce.classList.add('deco');   texte.textContent = 'Déconnecté'; break;
+    default:           puce.classList.add('simu');   texte.textContent = 'Simulation';
   }
 }
 
 /* ================================================================
    8. RÉCEPTION DE LA POSITION GPS DEPUIS FIREBASE REALTIME DATABASE
    ================================================================
-   L'ESP32 pousse un petit objet JSON sur le nœud /machine/position :
-     { lat, lon, cap, vit, rtk }
+   L'ESP32 pousse un objet JSON sur le nœud /machine/position :
+     { lat, lon, cap, vit, rtk, sat }
    Cette écoute est active dans TOUS les modes (Chauffeur ET Cave) :
-     - Tablette en cabine (mode Chauffeur) : voit le tracteur bouger via Firebase,
-       même si la simulation locale est inactive.
+     - Tablette en cabine (mode Chauffeur) : voit le tracteur bouger via Firebase.
      - Smartphone à la cave (mode Cave) : idem, lecture seule.
    La fonction updateGPSData reçoit le flag _depuisFirebase = true pour ne pas
    réécrire sur Firebase ce qu'elle vient d'en lire (garde-fou anti-boucle).
@@ -1475,9 +1491,8 @@ function majStatutSource(){
    Nommage des champs Firebase — l'ESP32 envoie des noms courts :
      cap = heading (cap en degrés)
      vit = vitesse en km/h
-     rtk = statut RTK brut (entier NMEA ou chaîne)
-   La simulation locale écrit aussi sur ce nœud (via envoyerPositionFirebase)
-   avec les mêmes noms courts, pour que la Cave voie la simulation.
+     rtk = statut RTK brut (entier NMEA — pas de filtre côté ESP32)
+     sat = nombre de satellites utilisés
 */
 function brancherReceptionFirebase(){
   if (!firebaseActif) return;
@@ -1499,6 +1514,9 @@ function brancherReceptionFirebase(){
     // Statut RTK : 'rtk' (ESP32) ou 'source' (format interne interface)
     const rtk = d.rtk !== undefined ? d.rtk : (d.source !== undefined ? d.source : undefined);
 
+    // Nombre de satellites : 'sat' (ESP32), undefined si absent (simulation locale ou ancienne version)
+    const sat = typeof d.sat === 'number' ? d.sat : undefined;
+
     // Synchronise l'état de la peinture si l'info vient du réseau (mode Cave principalement)
     // L'ESP32 n'envoie pas 'peinture', mais la simulation web la pousse via envoyerPositionFirebase
     if (etat.modeCave && typeof d.peinture === 'boolean' && d.peinture !== etat.peintureActive){
@@ -1506,7 +1524,8 @@ function brancherReceptionFirebase(){
     }
 
     // _depuisFirebase = true → updateGPSData ne réécrira pas sur Firebase (anti-boucle)
-    updateGPSData(d.lat, d.lon, cap, vit, rtk, true);
+    // sat est passé en 7ème argument ; si absent (undefined), l'affichage Satellites n'est pas modifié
+    updateGPSData(d.lat, d.lon, cap, vit, rtk, true, sat);
   });
 }
 
