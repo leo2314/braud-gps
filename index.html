@@ -296,7 +296,7 @@
 
 <div id="voile"></div>
 
-<!-- PANNEAU 1/2 — Réglages techniques uniquement (Largeur, Offset, WebSocket, Recentrage) -->
+<!-- PANNEAU 1/2 — Réglages techniques (Largeur, Offset, Source GNSS, Recentrage) -->
 <div id="panneau-parametres" class="panneau-lateral">
 
   <div class="seulement-chauffeur">
@@ -332,12 +332,16 @@
     </div>
     <p style="font-size:11px; color:var(--text-dim); margin:-10px 0 14px;">Positif = vers l'avant · Négatif = vers l'arrière</p>
 
-    <div class="panneau-titre">Connexion ESP32 / GNSS</div>
-    <div class="champ">
-      <label for="champ-ws">Adresse WebSocket de l'ESP32</label>
-      <input type="text" id="champ-ws" value="ws://192.168.4.1:81">
-    </div>
-    <button class="bouton-secondaire" id="bouton-connexion">Se connecter</button>
+    <div class="panneau-titre">Source GNSS</div>
+    <p style="font-size:12px; color:var(--text-dim); margin:0 0 10px;">
+      La position GPS est reçue automatiquement depuis Firebase
+      (poussée par l'ESP32 sur le nœud <code style="font-size:11px; color:var(--accent-green); background:var(--surface-2); padding:1px 5px; border-radius:4px;">/machine/position</code>).
+      Aucune configuration manuelle nécessaire.
+    </p>
+    <p style="font-size:12px; color:var(--text-dim); margin:0 0 6px;">
+      Format attendu de l'ESP32 :
+      <code style="font-size:11px; color:var(--accent-green); background:var(--surface-2); padding:1px 5px; border-radius:4px;">{lat, lon, cap, vit, rtk}</code>
+    </p>
   </div>
 
   <div class="panneau-titre">Suivi caméra</div>
@@ -483,11 +487,12 @@ const lissage = {
 };
 
 let traceCourante = null;
-let websocket = null;
+// Note : plus de variable 'websocket' — la position GPS arrive désormais exclusivement via Firebase
 let dernierEnvoiPosition = 0;
 let derniereParcelleTrouveeCle = null;      // optimisation 10 Hz : on reteste d'abord la dernière parcelle connue
 let dernierAffichageBoutonPeinture = null;  // 'actif' | 'attente' | null — évite des écritures DOM inutiles à 10 Hz
 let modeGommeManuelle = false;              // true = le prochain clic sur un tracé le supprime sans calcul Turf
+// Note : la variable 'websocket' a été supprimée — l'ESP32 pousse désormais via Firebase, pas WebSocket
 const tracesCreesLocalement = new Set(); // évite de redessiner nos propres tracés reçus en écho depuis Firebase
 const tracesParClé = {};                  // cle (Firebase ou locale) -> { feature: Polygone turf, calque: calque Leaflet }
                                            // registre indispensable à l'effacement ciblé par parcelle (turf.difference)
@@ -1344,8 +1349,41 @@ function rafraichirStatistiquesUI(){
    >>> En mode Chauffeur, c'est ICI que les vraies trames de l'ESP32 doivent être injectées.
    >>> En mode Cave, cette même fonction est appelée automatiquement depuis le flux Firebase.
 */
-function updateGPSData(lat, lon, heading, vitesseKmh){
+// Convertit la valeur brute du champ "rtk" de l'ESP32 vers l'une des clés reconnues par majStatutSource().
+// L'ESP32 peut envoyer un entier (standard NMEA : 1=GPS, 4=RTK Fix, 5=RTK Float)
+// ou directement une chaîne lisible ('RTK_FIX', 'RTK_FLOAT', 'SIMULATION'…).
+function mapperStatutRTK(rtk){
+  if (typeof rtk === 'string') return rtk; // déjà dans le bon format
+  if (typeof rtk === 'number'){
+    if (rtk === 4) return 'RTK_FIX';
+    if (rtk === 5) return 'RTK_FLOAT';
+    if (rtk === 1 || rtk === 2) return 'RTK_FLOAT'; // précision intermédiaire
+  }
+  return 'DECONNECTE';
+}
+
+/* ================================================================
+   >>> POINT D'ENTRÉE GPS <<<
+   En mode Chauffeur : appelée par la simulation locale (puis synchronise Firebase).
+   En mode Cave ET Chauffeur réel : appelée par l'écouteur Firebase (/machine/position).
+   ----------------------------------------------------------------
+   Paramètres :
+     lat, lon       — coordonnées WGS84 (nombres)
+     heading        — cap en degrés 0-360 (nombres)
+     vitesseKmh     — vitesse en km/h (nombre ou undefined → calculée par haversine)
+     rtk            — statut RTK brut de l'ESP32 (number ou string, optionnel)
+     _depuisFirebase— flag INTERNE : true si l'appel vient de l'écouteur Firebase,
+                      pour éviter que updateGPSData ne réécrive sur Firebase
+                      ce qu'il vient d'en lire (boucle infinie).
+*/
+function updateGPSData(lat, lon, heading, vitesseKmh, rtk, _depuisFirebase){
   heading = normaliserCap(heading);
+
+  // Mise à jour du statut RTK dans le bandeau si fourni
+  if (rtk !== undefined && rtk !== null){
+    etat.source = mapperStatutRTK(rtk);
+    majStatutSource();
+  }
 
   const vitesse = (typeof vitesseKmh === 'number')
     ? vitesseKmh
@@ -1361,7 +1399,9 @@ function updateGPSData(lat, lon, heading, vitesseKmh){
 
   ajouterPointPeinture(lat, lon, heading);
   majBandeau(heading, vitesse);
-  envoyerPositionFirebase(lat, lon, heading, vitesse);
+
+  // N'écrit sur Firebase que si l'appel vient de la simulation locale (jamais d'un écho Firebase)
+  if (!_depuisFirebase) envoyerPositionFirebase(lat, lon, heading, vitesse);
 
   etat.derniereLat = lat;
   etat.derniereLon = lon;
@@ -1421,56 +1461,77 @@ function majStatutSource(){
 }
 
 /* ================================================================
-   8. CONNEXION TEMPS RÉEL À L'ESP32 (WebSocket) — Mode Chauffeur uniquement
-   ================================================================ */
-function connecterWebSocket(url){
-  if (etat.modeCave) return; // la Cave ne se connecte jamais directement à l'ESP32
+   8. RÉCEPTION DE LA POSITION GPS DEPUIS FIREBASE REALTIME DATABASE
+   ================================================================
+   L'ESP32 pousse un petit objet JSON sur le nœud /machine/position :
+     { lat, lon, cap, vit, rtk }
+   Cette écoute est active dans TOUS les modes (Chauffeur ET Cave) :
+     - Tablette en cabine (mode Chauffeur) : voit le tracteur bouger via Firebase,
+       même si la simulation locale est inactive.
+     - Smartphone à la cave (mode Cave) : idem, lecture seule.
+   La fonction updateGPSData reçoit le flag _depuisFirebase = true pour ne pas
+   réécrire sur Firebase ce qu'elle vient d'en lire (garde-fou anti-boucle).
 
-  try{
-    websocket = new WebSocket(url);
-    websocket.onopen = () => { etat.source = 'RTK_FLOAT'; majStatutSource(); arreterSimulation(); };
-    websocket.onclose = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
-    websocket.onerror = () => { etat.source = 'DECONNECTE'; majStatutSource(); };
+   Nommage des champs Firebase — l'ESP32 envoie des noms courts :
+     cap = heading (cap en degrés)
+     vit = vitesse en km/h
+     rtk = statut RTK brut (entier NMEA ou chaîne)
+   La simulation locale écrit aussi sur ce nœud (via envoyerPositionFirebase)
+   avec les mêmes noms courts, pour que la Cave voie la simulation.
+*/
+function brancherReceptionFirebase(){
+  if (!firebaseActif) return;
 
-    websocket.onmessage = (evenement) => {
-      try{
-        const trame = JSON.parse(evenement.data);
-        if (typeof trame.lat === 'number' && typeof trame.lon === 'number' && typeof trame.heading === 'number'){
-          if (trame.fix) { etat.source = trame.fix; majStatutSource(); }
-          updateGPSData(trame.lat, trame.lon, trame.heading, trame.speed);
-        }
-      }catch(erreur){
-        console.error('Trame JSON invalide reçue de l\'ESP32 :', erreur);
-      }
-    };
-  }catch(erreur){
-    console.error('Connexion WebSocket impossible :', erreur);
-    etat.source = 'DECONNECTE'; majStatutSource();
-  }
+  dbMachinePosition.on('value', snap => {
+    const d = snap.val();
+    if (!d || typeof d.lat !== 'number' || typeof d.lon !== 'number') return;
+
+    // Récupère le cap depuis 'cap' (ESP32) ou 'heading' (ancienne simulation) pour rétrocompatibilité
+    const cap = typeof d.cap === 'number' ? d.cap : (typeof d.heading === 'number' ? d.heading : null);
+    if (cap === null) return; // trame sans cap : ignorée (pas assez pour calculer la peinture)
+
+    // Vitesse : 'vit' (ESP32) ou 'vitesse' ou 'speed' (anciens formats)
+    const vit = typeof d.vit === 'number' ? d.vit
+              : typeof d.vitesse === 'number' ? d.vitesse
+              : typeof d.speed === 'number' ? d.speed
+              : undefined;
+
+    // Statut RTK : 'rtk' (ESP32) ou 'source' (format interne interface)
+    const rtk = d.rtk !== undefined ? d.rtk : (d.source !== undefined ? d.source : undefined);
+
+    // Synchronise l'état de la peinture si l'info vient du réseau (mode Cave principalement)
+    // L'ESP32 n'envoie pas 'peinture', mais la simulation web la pousse via envoyerPositionFirebase
+    if (etat.modeCave && typeof d.peinture === 'boolean' && d.peinture !== etat.peintureActive){
+      definirPeinture(d.peinture);
+    }
+
+    // _depuisFirebase = true → updateGPSData ne réécrira pas sur Firebase (anti-boucle)
+    updateGPSData(d.lat, d.lon, cap, vit, rtk, true);
+  });
 }
-
-document.getElementById('bouton-connexion').addEventListener('click', () => {
-  const url = document.getElementById('champ-ws').value.trim();
-  if (url) connecterWebSocket(url);
-});
 
 /* ================================================================
    9. SYNCHRONISATION TEMPS RÉEL AVEC FIREBASE
    ================================================================
-   Chauffeur : ÉCRIT machine/position (continu), machine/config (au changement),
-               parcelles/* (création) et recolte/traces/* (à chaque fin de tracé).
-   Cave      : LIT tout ce qui précède, et ne connaît jamais l'ESP32.
+   Chauffeur (simulation) : ÉCRIT machine/position (continu), machine/config,
+               parcelles/* et recolte/traces/* (à chaque fin de tracé).
+   Chauffeur (ESP32 réel) : L'ESP32 écrit machine/position directement —
+               l'interface ne réécrit pas (guard _depuisFirebase dans updateGPSData).
+   Cave      : LIT uniquement, n'écrit jamais.
 */
 function envoyerPositionFirebase(lat, lon, heading, vitesse){
   if (!firebaseActif || etat.modeCave) return;
   const maintenant = performance.now();
-  if (maintenant - dernierEnvoiPosition < 120) return; // ~8 envois/s : fluide à la cave, raisonnable pour la RTDB
+  if (maintenant - dernierEnvoiPosition < 120) return; // ~8 envois/s
   dernierEnvoiPosition = maintenant;
 
+  // Champs courts alignés sur le format de l'ESP32 (cap/vit/rtk) + champs longs en alias pour la rétrocompatibilité
   dbMachinePosition.set({
-    lat, lon, heading, vitesse,
-    peinture: etat.peintureActive,
-    source: etat.source,
+    lat, lon,
+    cap: heading,      // nom court : ESP32 et réception Firebase s'accordent sur 'cap'
+    vit: vitesse,      // nom court : même logique pour la vitesse
+    rtk: etat.source,  // statut RTK courant (chaîne : 'SIMULATION', 'RTK_FIX', etc.)
+    peinture: etat.peintureActive, // la Cave l'utilise pour synchroniser l'état du bouton peinture
     t: firebase.database.ServerValue.TIMESTAMP
   }).catch(erreur => console.error('Échec de l\'envoi de la position à Firebase :', erreur));
 }
@@ -1556,19 +1617,11 @@ if (firebaseActif){
   });
 
   // --- Mode Cave : écoute la position/le cap/l'état de peinture de la machine en direct ---
-  if (etat.modeCave){
-    dbMachinePosition.on('value', snap => {
-      const d = snap.val();
-      if (!d || typeof d.lat !== 'number' || typeof d.lon !== 'number' || typeof d.heading !== 'number') return;
-
-      if (d.source) { etat.source = d.source; majStatutSource(); }
-      if (typeof d.peinture === 'boolean' && d.peinture !== etat.peintureActive){
-        definirPeinture(d.peinture); // reconstitue le même tracé qu'au tracteur, sans jamais réécrire sur Firebase
-      }
-      updateGPSData(d.lat, d.lon, d.heading, d.vitesse);
-    });
-  }
+  // (ancien bloc if(etat.modeCave) supprimé — brancherReceptionFirebase() gère tous les modes)
 }
+
+// Active l'écoute de position Firebase pour TOUS les appareils (Chauffeur et Cave)
+brancherReceptionFirebase();
 
 /* ================================================================
    10. MODE SIMULATION (test au bureau, sans ESP32) — Mode Chauffeur uniquement
