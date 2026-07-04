@@ -348,6 +348,13 @@
       Format attendu de l'ESP32 :
       <code style="font-size:11px; color:var(--accent-green); background:var(--surface-2); padding:1px 5px; border-radius:4px;">{lat, lon, cap, vit, rtk}</code>
     </p>
+    <div class="champ" style="margin-top:12px;">
+      <label for="champ-ntrip">Base Centipède (Mountpoint)</label>
+      <input type="text" id="champ-ntrip" placeholder="ex: NANT" maxlength="10">
+    </div>
+    <p style="font-size:11px; color:var(--text-dim); margin:-10px 0 6px;">
+      ⚠️ Pris en compte par l'ESP32 uniquement à son prochain redémarrage.
+    </p>
   </div>
 
   <div class="panneau-titre">Suivi caméra</div>
@@ -478,6 +485,7 @@ const etat = {
   largeurM: 2.50,
   offsetM: 1.20,
   offsetLongitudinalM: 0,   // déport avant (+) / arrière (-), le long de l'axe du cap
+  ntripMountpoint: 'IGNU',  // base Centipède RTK (lue par l'ESP32 à son démarrage uniquement)
   dernierePositionTemps: null,
   zoneRecolteTotale: null   // union GeoJSON (turf) de toute la surface déjà peinte
 };
@@ -1558,7 +1566,8 @@ function envoyerPositionFirebase(lat, lon, heading, vitesse){
 function envoyerConfigFirebase(){
   if (!firebaseActif || etat.modeCave) return;
   dbMachineConfig.set({
-    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote, offsetLongitudinalM: etat.offsetLongitudinalM
+    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote, offsetLongitudinalM: etat.offsetLongitudinalM,
+    ntripMountpoint: etat.ntripMountpoint
   }).catch(erreur => console.error('Échec de l\'envoi de la configuration à Firebase :', erreur));
 }
 
@@ -1576,13 +1585,16 @@ if (firebaseActif){
     if (typeof d.offsetM === 'number') etat.offsetM = d.offsetM;
     if (d.cote === 'gauche' || d.cote === 'droite') etat.cote = d.cote;
     if (typeof d.offsetLongitudinalM === 'number') etat.offsetLongitudinalM = d.offsetLongitudinalM;
+    if (typeof d.ntripMountpoint === 'string' && d.ntripMountpoint) etat.ntripMountpoint = d.ntripMountpoint;
 
     const champLargeur = document.getElementById('champ-largeur');
     const champOffset  = document.getElementById('champ-offset');
     const champOffsetLongitudinal = document.getElementById('champ-offset-longitudinal');
+    const champNtrip   = document.getElementById('champ-ntrip');
     if (champLargeur) champLargeur.value = etat.largeurM.toFixed(2);
     if (champOffset)  champOffset.value  = etat.offsetM.toFixed(2);
     if (champOffsetLongitudinal) champOffsetLongitudinal.value = etat.offsetLongitudinalM.toFixed(2);
+    if (champNtrip)   champNtrip.value   = etat.ntripMountpoint;
     document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
     document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
   });
@@ -1722,6 +1734,11 @@ document.getElementById('champ-offset-longitudinal').addEventListener('input', (
   const v = parseFloat(e.target.value);
   if (!isNaN(v)){ etat.offsetLongitudinalM = v; envoyerConfigFirebase(); } // pas de borne >=0 : la valeur est signée (avant/arrière)
 });
+document.getElementById('champ-ntrip').addEventListener('input', (e) => {
+  const v = e.target.value.toUpperCase().trim();
+  e.target.value = v; // reflète la mise en majuscules directement dans le champ
+  if (v){ etat.ntripMountpoint = v; envoyerConfigFirebase(); }
+});
 
 function selectionnerCote(cote){
   etat.cote = cote;
@@ -1770,7 +1787,7 @@ function sauvegarderProfilsTracteurs(){
 // Profil par défaut "Braud SB35", créé une seule fois si l'appareil n'a encore aucun profil enregistré
 const profilsExistants = chargerProfilsTracteurs();
 let profilsTracteurs = profilsExistants || [
-  { nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0 }
+  { nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0, ntripMountpoint: 'IGNU' }
 ];
 if (!profilsExistants) sauvegarderProfilsTracteurs(); // première utilisation : on persiste le profil par défaut
 
@@ -1797,10 +1814,12 @@ function appliquerProfilTracteur(nom){
   etat.offsetM = profil.offsetM;
   etat.cote = profil.cote;
   etat.offsetLongitudinalM = profil.offsetLongitudinalM || 0;
+  etat.ntripMountpoint = profil.ntripMountpoint || 'IGNU'; // profils anciens sans ce champ : valeur par défaut
 
   document.getElementById('champ-largeur').value = etat.largeurM.toFixed(2);
   document.getElementById('champ-offset').value = etat.offsetM.toFixed(2);
   document.getElementById('champ-offset-longitudinal').value = etat.offsetLongitudinalM.toFixed(2);
+  document.getElementById('champ-ntrip').value = etat.ntripMountpoint;
   document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
   document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
 
@@ -1819,6 +1838,7 @@ document.getElementById('bouton-sauvegarder-profil').addEventListener('click', (
   profil.offsetM = etat.offsetM;
   profil.cote = etat.cote;
   profil.offsetLongitudinalM = etat.offsetLongitudinalM;
+  profil.ntripMountpoint = etat.ntripMountpoint;
   sauvegarderProfilsTracteurs();
   window.alert('Profil « ' + profilActifNom + ' » mis à jour.');
 });
@@ -1836,7 +1856,8 @@ document.getElementById('bouton-nouveau-profil').addEventListener('click', () =>
 
   profilsTracteurs.push({
     nom: nomFinal,
-    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote, offsetLongitudinalM: etat.offsetLongitudinalM
+    largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote,
+    offsetLongitudinalM: etat.offsetLongitudinalM, ntripMountpoint: etat.ntripMountpoint
   });
   sauvegarderProfilsTracteurs();
   rafraichirSelectProfils();
