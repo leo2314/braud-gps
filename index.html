@@ -7,8 +7,6 @@
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<!-- Plugin de rotation de carte (mode "Waze" : cap en haut). DOIT etre charge apres leaflet.js -->
-<script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate.js"></script>
 
 <!-- Leaflet-Geoman : dessin des parcelles (polygones) directement sur la carte -->
 <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />
@@ -144,6 +142,7 @@
   }
   .bouton-secondaire.alerte{ border-color:var(--accent-red); color:var(--accent-red); }
   #bouton-gomme-manuelle.actif{ background:var(--accent-red-soft); border-color:var(--accent-red); color:var(--accent-red); }
+  #bouton-coloriage-manuel.actif{ background:rgba(0,84,166,0.18); border-color:#0054A6; color:#5BA3E0; }
 
   /* Liste des parcelles et de leur avancement (visible Chauffeur ET Cave) */
   #liste-parcelles{ display:flex; flex-direction:column; gap:10px; }
@@ -402,8 +401,12 @@
   <div class="champ seulement-chauffeur">
     <button class="bouton-secondaire" id="bouton-nettoyer-hors-parcelles">🧽 Nettoyer les tracés hors parcelles</button>
     <button class="bouton-secondaire" id="bouton-gomme-manuelle" style="margin-top:8px;">🧹 Gomme manuelle</button>
+    <button class="bouton-secondaire" id="bouton-coloriage-manuel" style="margin-top:8px;">🖌️ Coloriage manuel</button>
     <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
       Gomme manuelle : une fois activée, cliquez sur un tracé de peinture sur la carte pour le supprimer entièrement, sans calcul de découpe (utile sur un tracé qui refuse de s'effacer normalement).
+    </p>
+    <p style="font-size:11px; color:var(--text-dim); margin:8px 0 0;">
+      Coloriage manuel : dessinez un polygone à la main pour peindre une zone directement (utile pour compléter une portion manquée sans repasser avec la machine).
     </p>
   </div>
 
@@ -537,6 +540,7 @@ let dernierEnvoiPosition = 0;
 let derniereParcelleTrouveeCle = null;      // optimisation 10 Hz : on reteste d'abord la dernière parcelle connue
 let dernierAffichageBoutonPeinture = null;  // 'actif' | 'attente' | null — évite des écritures DOM inutiles à 10 Hz
 let modeGommeManuelle = false;              // true = le prochain clic sur un tracé le supprime sans calcul Turf
+let modeColoriageManuel = false;            // true = le prochain polygone dessiné est peint (et non une parcelle)
 // Note : la variable 'websocket' a été supprimée — l'ESP32 pousse désormais via Firebase, pas WebSocket
 const tracesCreesLocalement = new Set(); // évite de redessiner nos propres tracés reçus en écho depuis Firebase
 const tracesParClé = {};                  // cle (Firebase ou locale) -> { feature: Polygone turf, calque: calque Leaflet }
@@ -552,10 +556,7 @@ let geojsonEnCours = null;                // géométrie GeoJSON du polygone qui
 const carte = L.map('carte', {
   zoomControl:false,
   attributionControl:true,
-  tap:true,
-  rotate:true,              // plugin leaflet-rotate : autorise carte.setBearing()
-  rotateControl:false,      // pas de bouton de rotation manuel : le cap GPS pilote tout
-  touchRotate:false         // rotation a deux doigts desactivee (evite les faux mouvements en cabine)
+  tap:true
 }).setView([etat.derniereLat, etat.derniereLon], 19);
 
 const coucheSatellite = L.tileLayer(
@@ -769,6 +770,16 @@ function ajouterPointPeinture(latDeg, lonDeg, capDeg){
 
   const ruban = traceCourante.pointsGauche.concat(traceCourante.pointsDroite.slice().reverse());
   traceCourante.polygone.setLatLngs(ruban);
+
+  // --- Sauvegarde continue par blocs (chunking) ---
+  // Au-delà de 60 points, on clôt le bloc courant (envoyé à Firebase par finaliserTrace)
+  // et on en ouvre un nouveau immédiatement. En cas de rafraîchissement du navigateur,
+  // on ne perd au pire que le dernier bloc en cours au lieu de tout le tracé.
+  // Les blocs se chevauchent visuellement au dernier point, la peinture reste continue.
+  if (traceCourante.pointsGauche.length > 60){
+    finaliserTrace();
+    demarrerNouveauTrace();
+  }
 }
 
 // Transforme le ruban [lat,lon] dessiné à l'écran en Polygone GeoJSON (turf), prêt pour union()/intersect()
@@ -903,6 +914,12 @@ function definirPeinture(active){
 
 document.getElementById('bouton-peinture').addEventListener('click', () => {
   definirPeinture(!etat.peintureActive);
+});
+
+// Sauvegarde anti-perte : si la page est fermée/rafraîchie alors qu'un tracé est en cours,
+// on le finalise (envoi Firebase) avant de partir, plutôt que de le perdre.
+window.addEventListener('beforeunload', () => {
+  if (traceCourante) finaliserTrace();
 });
 
 /* ================================================================
@@ -1066,8 +1083,47 @@ if (!etat.modeCave){
 
   carte.on('pm:create', (evenement) => {
     if (evenement.shape !== 'Polygon') return;
-    const calqueTemporaire = evenement.layer;
 
+    // --- Mode COLORIAGE MANUEL : le polygone dessiné est peint directement (pas une parcelle) ---
+    if (modeColoriageManuel){
+      const geojsonPeinture = evenement.layer.toGeoJSON();
+      carte.removeLayer(evenement.layer); // retire le calque de dessin brut de Geoman
+
+      const polygone = nettoyerGeometrie(geojsonPeinture); // buffer(0) : robustesse anti auto-intersection
+      if (polygone){
+        // Fusionne dans la zone récoltée totale (pour le calcul des %)
+        try{
+          etat.zoneRecolteTotale = etat.zoneRecolteTotale
+            ? nettoyerGeometrie(turf.union(etat.zoneRecolteTotale, polygone))
+            : polygone;
+        }catch(erreur){
+          console.error('Fusion du coloriage manuel impossible :', erreur);
+        }
+
+        // Enregistre comme un tracé de peinture normal : Firebase + registre local + calque
+        if (firebaseActif){
+          const reference = dbRecolteTraces.push();
+          tracesCreesLocalement.add(reference.key);
+          tracesParClé[reference.key] = { feature: polygone, calque: creerCalqueTrace(polygone, reference.key) };
+          reference.set({
+            geojson: polygone.geometry,
+            t: firebase.database.ServerValue.TIMESTAMP
+          }).catch(erreur => console.error('Échec de la synchronisation du coloriage manuel :', erreur));
+        } else {
+          const cleLocale = 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+          tracesParClé[cleLocale] = { feature: polygone, calque: creerCalqueTrace(polygone, cleLocale) };
+        }
+
+        recalculerToutesParcelles();
+      }
+
+      // Désarme le mode coloriage (usage unique, comme la gomme manuelle)
+      desactiverColoriageManuel();
+      return;
+    }
+
+    // --- Comportement standard : création d'une parcelle ---
+    const calqueTemporaire = evenement.layer;
     geojsonEnCours = calqueTemporaire.toGeoJSON();
     carte.removeLayer(calqueTemporaire); // remplacée par le rendu standard (contour jaune) dès la confirmation
 
@@ -1305,6 +1361,31 @@ document.getElementById('bouton-gomme-manuelle').addEventListener('click', () =>
 });
 document.getElementById('bouton-nettoyer-hors-parcelles').addEventListener('click', nettoyerTracesHorsParcelles);
 
+/* ================================================================
+   6quinquies. COLORIAGE MANUEL — peindre une zone en la dessinant à la main
+   ================================================================ */
+// Active l'outil polygone de Geoman ; le prochain polygone tracé sera peint
+// directement (géré dans pm:create quand modeColoriageManuel === true).
+function activerColoriageManuel(){
+  // On désarme la gomme si elle était active : les deux modes sont mutuellement exclusifs
+  if (modeGommeManuelle) desactiverGommeManuelle();
+  modeColoriageManuel = true;
+  const bouton = document.getElementById('bouton-coloriage-manuel');
+  if (bouton) bouton.classList.add('actif');
+  fermerPanneaux(); // ferme le tiroir pour laisser la carte libre au dessin
+  carte.pm.enableDraw('Polygon');
+}
+function desactiverColoriageManuel(){
+  modeColoriageManuel = false;
+  const bouton = document.getElementById('bouton-coloriage-manuel');
+  if (bouton) bouton.classList.remove('actif');
+  try{ carte.pm.disableDraw(); }catch(e){ /* déjà désactivé : sans effet */ }
+}
+
+document.getElementById('bouton-coloriage-manuel').addEventListener('click', () => {
+  modeColoriageManuel ? desactiverColoriageManuel() : activerColoriageManuel();
+});
+
 function rafraichirListeParcellesUI(){
   const conteneur = document.getElementById('liste-parcelles');
   const cles = Object.keys(parcellesAffichees);
@@ -1483,11 +1564,8 @@ function updateGPSData(lat, lon, heading, vitesseKmh, rtk, _depuisFirebase, sate
 }
 
 // === BOUCLE D'ANIMATION (60 FPS) — anime aussi bien les données locales que celles reçues de Firebase ===
-// Mode "Waze" : quand le suivi caméra est actif, c'est la CARTE qui tourne (setBearing)
-// pour que le tracteur pointe toujours vers le haut de l'écran.
-// L'icône est alors orientée à (cap - rotation de la carte) : les deux rotations se
-// compensent et le tracteur reste visuellement pointé vers le haut, tandis que le
-// paysage tourne autour de lui. Suivi désactivé → carte remise au nord, icône au cap réel.
+// La carte reste fixe (Nord en haut) : c'est l'icône du tracteur qui pivote sur elle-même
+// selon le cap, et la caméra le suit (setView) quand le suivi est activé.
 function boucleAnimationFluide() {
   const k = 0.18; // Force du lissage (plus bas = plus fluide mais léger retard)
 
@@ -1496,18 +1574,10 @@ function boucleAnimationFluide() {
   lissage.capAffiche += (lissage.capCible - lissage.capAffiche) * k;
 
   marqueurMachine.setLatLng([lissage.latAffichee, lissage.lonAffichee]);
+  orienterIcone(normaliserCap(lissage.capAffiche));
 
   if (etat.suivreCamera) {
-    // Rotation de la carte : bearing = -cap (i.e. 360 - cap) => le cap pointe vers le haut
-    const bearingCarte = 360 - normaliserCap(lissage.capAffiche);
-    carte.setBearing(bearingCarte);
-    // L'icône compense la rotation de la carte : cap + bearing = 0 (mod 360) => pointe en haut
-    orienterIcone(normaliserCap(lissage.capAffiche + bearingCarte));
     carte.setView([lissage.latAffichee, lissage.lonAffichee], carte.getZoom(), { animate: false });
-  } else {
-    // Suivi désactivé : carte figée au nord, icône orientée au cap réel
-    if (carte.getBearing() !== 0) carte.setBearing(0);
-    orienterIcone(normaliserCap(lissage.capAffiche));
   }
 
   requestAnimationFrame(boucleAnimationFluide);
