@@ -340,6 +340,7 @@
     <div class="profil-actions">
       <button class="bouton-secondaire" id="bouton-sauvegarder-profil">💾 Sauvegarder</button>
       <button class="bouton-secondaire" id="bouton-nouveau-profil">➕ Nouveau profil</button>
+      <button class="bouton-secondaire alerte" id="bouton-supprimer-profil">🗑️ Supprimer</button>
     </div>
 
     <div class="panneau-titre">Tracé de peinture</div>
@@ -1996,6 +1997,9 @@ function appliquerProfilTracteur(nom){
   rafraichirSelectProfils(); // aligne le <select> sur le profil désormais actif
 
   envoyerConfigFirebase(); // les valeurs du profil deviennent immédiatement actives pour toute la machine
+
+  // Propage le profil actif à tous les appareils (l'écouteur dbProfilActif ignore les échos identiques)
+  if (firebaseActif && !etat.modeCave) { dbProfilActif.set(nom).catch(e => console.error(e)); }
 }
 
 // Le changement de profil dans la liste déroulante est propagé à Firebase, pour que
@@ -2039,6 +2043,27 @@ document.getElementById('bouton-nouveau-profil').addEventListener('click', () =>
   sauvegarderProfilsFirebase();
 });
 
+// Supprime le profil actif (avec confirmation), puis bascule sur le premier profil restant
+document.getElementById('bouton-supprimer-profil').addEventListener('click', () => {
+  if (profilsTracteurs.length <= 1) {
+    window.alert('Impossible de supprimer le dernier profil. Vous devez en conserver au moins un.');
+    return;
+  }
+
+  const confirmation = window.confirm(`Êtes-vous sûr de vouloir supprimer définitivement le profil « ${profilActifNom} » ?`);
+  if (!confirmation) return;
+
+  // On retire le profil de la liste
+  profilsTracteurs = profilsTracteurs.filter(p => p.nom !== profilActifNom);
+
+  // On bascule automatiquement sur le premier profil restant
+  profilActifNom = profilsTracteurs[0].nom;
+
+  rafraichirSelectProfils();
+  sauvegarderProfilsFirebase(); // Pousse la nouvelle liste nettoyée sur le Cloud
+  appliquerProfilTracteur(profilActifNom); // Applique les réglages du profil de secours
+});
+
 // --- Écoute temps réel des profils + migration initiale localStorage -> Firebase ---
 if (firebaseActif) {
   dbProfilsListe.on('value', snap => {
@@ -2058,8 +2083,10 @@ if (firebaseActif) {
   dbProfilActif.on('value', snap => {
     const actif = snap.val();
     if (actif) {
-      profilActifNom = actif;
-      appliquerProfilTracteur(actif);
+      if (actif !== profilActifNom) {
+        profilActifNom = actif;
+        appliquerProfilTracteur(actif);
+      }
     } else {
       profilActifNom = localStorage.getItem(CLE_LOCALSTORAGE_PROFIL_ACTIF) || profilsTracteurs[0].nom;
       if (!etat.modeCave) dbProfilActif.set(profilActifNom);
