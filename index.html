@@ -490,11 +490,14 @@ try{
 
 // Références utilisées dans toute l'application (créées seulement si Firebase a démarré)
 let dbMachinePosition, dbMachineConfig, dbParcelles, dbRecolteTraces;
+let dbProfilsListe, dbProfilActif;
 if (firebaseActif){
   dbMachinePosition = db.ref('machine/position');
   dbMachineConfig   = db.ref('machine/config');
   dbParcelles       = db.ref('parcelles');
   dbRecolteTraces   = db.ref('recolte/traces');
+  dbProfilsListe    = db.ref('machine/profils/liste');
+  dbProfilActif     = db.ref('machine/profils/actif');
 }
 
 /* ================================================================
@@ -1856,12 +1859,12 @@ document.getElementById('bouton-panneau-parcelles').addEventListener('click', ()
 document.getElementById('bouton-panneau-statistiques').addEventListener('click', () => ouvrirPanneau(panneauStatistiques));
 voile.addEventListener('click', fermerPanneaux);
 
-// Persiste une modification de réglage dans le profil de tracteur actif (localStorage).
+// Persiste une modification de réglage dans le profil de tracteur actif (Firebase).
 // Sans ça, appliquerProfilTracteur() rechargerait l'ancienne valeur au prochain
-// rafraîchissement et écraserait Firebase avec des réglages périmés.
+// rafraîchissement et écraserait la config avec des réglages périmés.
 function majProfilActif(cle, valeur){
   const profil = profilsTracteurs.find(p => p.nom === profilActifNom);
-  if (profil){ profil[cle] = valeur; sauvegarderProfilsTracteurs(); }
+  if (profil){ profil[cle] = valeur; sauvegarderProfilsFirebase(); }
 }
 
 document.getElementById('champ-largeur').addEventListener('input', (e) => {
@@ -1921,14 +1924,20 @@ document.getElementById('bouton-recentrer').addEventListener('click', () => {
 });
 
 /* ================================================================
-   11bis. PROFILS DE TRACTEUR — Largeur / Déport latéral / Côté / Déport longitudinal (localStorage)
+   11bis. PROFILS DE TRACTEUR — synchronisés via Firebase (tous appareils)
    ================================================================
-   Stockage 100% local à l'appareil (chaque tablette/téléphone garde ses propres profils) :
-   ça n'a pas besoin de Firebase, ce sont des réglages MATÉRIELS propres à l'engin utilisé.
+   Largeur / Déport latéral / Côté / Déport longitudinal / base NTRIP.
+   La liste des profils et le profil actif sont désormais stockés sur Firebase
+   (machine/profils/liste et machine/profils/actif) : un profil créé sur
+   l'ordinateur apparaît automatiquement sur le téléphone, et inversement.
+   Le localStorage ne sert plus que de "roue de secours" pour la migration
+   initiale (chargerProfilsTracteurs) la toute première fois.
 */
 const CLE_LOCALSTORAGE_PROFILS = 'profilsTracteurs';
 const CLE_LOCALSTORAGE_PROFIL_ACTIF = 'profilTracteurActifNom';
 
+// Roue de secours : lit les anciens profils encore présents dans le localStorage
+// de cet appareil (utilisée uniquement lors de la migration initiale vers Firebase).
 function chargerProfilsTracteurs(){
   try{
     const bruts = localStorage.getItem(CLE_LOCALSTORAGE_PROFILS);
@@ -1942,21 +1951,21 @@ function chargerProfilsTracteurs(){
   return null;
 }
 
-function sauvegarderProfilsTracteurs(){
-  try{ localStorage.setItem(CLE_LOCALSTORAGE_PROFILS, JSON.stringify(profilsTracteurs)); }
-  catch(erreur){ console.error('Écriture des profils de tracteur impossible (localStorage) :', erreur); }
+// Sauvegarde la liste des profils ET le profil actif sur Firebase (partagé entre appareils).
+// La Cave est en lecture seule : elle ne réécrit jamais les profils.
+function sauvegarderProfilsFirebase() {
+  if (firebaseActif && !etat.modeCave) {
+    dbProfilsListe.set(profilsTracteurs).catch(e => console.error(e));
+    dbProfilActif.set(profilActifNom).catch(e => console.error(e));
+  }
 }
 
-// Profil par défaut "Braud SB35", créé une seule fois si l'appareil n'a encore aucun profil enregistré
-const profilsExistants = chargerProfilsTracteurs();
-let profilsTracteurs = profilsExistants || [
+// Valeurs initiales avant réception Firebase : un profil par défaut, remplacé
+// dès que l'écouteur dbProfilsListe.on('value') reçoit les données du cloud.
+let profilsTracteurs = [
   { nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0, ntripMountpoint: 'IGNU' }
 ];
-if (!profilsExistants) sauvegarderProfilsTracteurs(); // première utilisation : on persiste le profil par défaut
-
-// On se souvient du dernier profil utilisé sur CET appareil, pour ne pas avoir à le resélectionner à chaque rechargement
-let profilActifNom = localStorage.getItem(CLE_LOCALSTORAGE_PROFIL_ACTIF) || profilsTracteurs[0].nom;
-if (!profilsTracteurs.some(p => p.nom === profilActifNom)) profilActifNom = profilsTracteurs[0].nom; // garde-fou
+let profilActifNom = profilsTracteurs[0].nom;
 
 function rafraichirSelectProfils(){
   const select = document.getElementById('select-profil');
@@ -1971,7 +1980,6 @@ function appliquerProfilTracteur(nom){
   if (!profil) return;
 
   profilActifNom = nom;
-  try{ localStorage.setItem(CLE_LOCALSTORAGE_PROFIL_ACTIF, nom); }catch(erreur){ /* pas bloquant */ }
 
   etat.largeurM = profil.largeurM;
   etat.offsetM = profil.offsetM;
@@ -1985,12 +1993,16 @@ function appliquerProfilTracteur(nom){
   document.getElementById('champ-ntrip').value = etat.ntripMountpoint;
   document.getElementById('cote-gauche').classList.toggle('actif', etat.cote === 'gauche');
   document.getElementById('cote-droite').classList.toggle('actif', etat.cote === 'droite');
+  rafraichirSelectProfils(); // aligne le <select> sur le profil désormais actif
 
   envoyerConfigFirebase(); // les valeurs du profil deviennent immédiatement actives pour toute la machine
 }
 
+// Le changement de profil dans la liste déroulante est propagé à Firebase, pour que
+// tous les appareils basculent sur le même profil actif.
 document.getElementById('select-profil').addEventListener('change', (e) => {
   appliquerProfilTracteur(e.target.value);
+  sauvegarderProfilsFirebase();
 });
 
 // Écrase le profil actif avec les valeurs actuellement réglées (ne crée rien : "Nouveau profil" fait ça)
@@ -2002,7 +2014,7 @@ document.getElementById('bouton-sauvegarder-profil').addEventListener('click', (
   profil.cote = etat.cote;
   profil.offsetLongitudinalM = etat.offsetLongitudinalM;
   profil.ntripMountpoint = etat.ntripMountpoint;
-  sauvegarderProfilsTracteurs();
+  sauvegarderProfilsFirebase();
   window.alert('Profil « ' + profilActifNom + ' » mis à jour.');
 });
 
@@ -2022,10 +2034,38 @@ document.getElementById('bouton-nouveau-profil').addEventListener('click', () =>
     largeurM: etat.largeurM, offsetM: etat.offsetM, cote: etat.cote,
     offsetLongitudinalM: etat.offsetLongitudinalM, ntripMountpoint: etat.ntripMountpoint
   });
-  sauvegarderProfilsTracteurs();
-  rafraichirSelectProfils();
   appliquerProfilTracteur(nomFinal);
+  rafraichirSelectProfils();
+  sauvegarderProfilsFirebase();
 });
+
+// --- Écoute temps réel des profils + migration initiale localStorage -> Firebase ---
+if (firebaseActif) {
+  dbProfilsListe.on('value', snap => {
+    const liste = snap.val();
+    if (liste) {
+      profilsTracteurs = liste;
+      rafraichirSelectProfils();
+    } else {
+      // Aucune liste sur Firebase : première utilisation -> on migre les profils
+      // locaux de cet appareil (ou le profil par défaut) vers le cloud.
+      const local = chargerProfilsTracteurs();
+      profilsTracteurs = local || [{ nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0, ntripMountpoint: 'IGNU' }];
+      if (!etat.modeCave) dbProfilsListe.set(profilsTracteurs);
+    }
+  });
+
+  dbProfilActif.on('value', snap => {
+    const actif = snap.val();
+    if (actif) {
+      profilActifNom = actif;
+      appliquerProfilTracteur(actif);
+    } else {
+      profilActifNom = localStorage.getItem(CLE_LOCALSTORAGE_PROFIL_ACTIF) || profilsTracteurs[0].nom;
+      if (!etat.modeCave) dbProfilActif.set(profilActifNom);
+    }
+  });
+}
 
 /* ================================================================
    12. INITIALISATION
@@ -2033,8 +2073,8 @@ document.getElementById('bouton-nouveau-profil').addEventListener('click', () =>
 document.body.classList.toggle('mode-cave', etat.modeCave);
 document.getElementById('texte-mode').textContent = etat.modeCave ? '🍷 Cave' : '🚜 Chauffeur';
 
-rafraichirSelectProfils();
-appliquerProfilTracteur(profilActifNom); // charge largeur/offset/côté/déport longitudinal avant toute autre init
+// Note : le chargement du profil est désormais asynchrone — il est déclenché par les
+// écouteurs dbProfilsListe.on('value') / dbProfilActif.on('value') de la section 11bis.
 
 majStatutSource();
 majBandeau(etat.dernierCap, etat.vitesseKmh);
