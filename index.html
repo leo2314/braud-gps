@@ -576,10 +576,11 @@ const coucheOSM = L.tileLayer(
 // --- Cadastre francais (WMS Geoplateforme IGN) ---
 // Parcellaire Express : limites cadastrales officielles, PNG transparent,
 // superposable au fond satellite (case a cocher dans le controleur de calques).
-const coucheCadastre = L.tileLayer.wms('https://data.geopf.fr/wms-r/wms', {
+const coucheCadastre = L.tileLayer.wms('https://data.geopf.fr/wms-v/wms', {
   layers: 'CADASTRALPARCELS.PARCELLAIRE_EXPRESS',
   format: 'image/png',
   transparent: true,
+  version: '1.3.0',
   maxZoom: 22,
   attribution: '© IGN — Cadastre'
 });
@@ -1854,28 +1855,37 @@ document.getElementById('bouton-panneau-parcelles').addEventListener('click', ()
 document.getElementById('bouton-panneau-statistiques').addEventListener('click', () => ouvrirPanneau(panneauStatistiques));
 voile.addEventListener('click', fermerPanneaux);
 
+// Persiste une modification de réglage dans le profil de tracteur actif (localStorage).
+// Sans ça, appliquerProfilTracteur() rechargerait l'ancienne valeur au prochain
+// rafraîchissement et écraserait Firebase avec des réglages périmés.
+function majProfilActif(cle, valeur){
+  const profil = profilsTracteurs.find(p => p.nom === profilActifNom);
+  if (profil){ profil[cle] = valeur; sauvegarderProfilsTracteurs(); }
+}
+
 document.getElementById('champ-largeur').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
-  if (!isNaN(v) && v > 0){ etat.largeurM = v; envoyerConfigFirebase(); }
+  if (!isNaN(v) && v > 0){ etat.largeurM = v; majProfilActif('largeurM', v); envoyerConfigFirebase(); }
 });
 document.getElementById('champ-offset').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
-  if (!isNaN(v) && v >= 0){ etat.offsetM = v; envoyerConfigFirebase(); }
+  if (!isNaN(v) && v >= 0){ etat.offsetM = v; majProfilActif('offsetM', v); envoyerConfigFirebase(); }
 });
 document.getElementById('champ-offset-longitudinal').addEventListener('input', (e) => {
   const v = parseFloat(e.target.value);
-  if (!isNaN(v)){ etat.offsetLongitudinalM = v; envoyerConfigFirebase(); } // pas de borne >=0 : la valeur est signée (avant/arrière)
+  if (!isNaN(v)){ etat.offsetLongitudinalM = v; majProfilActif('offsetLongitudinalM', v); envoyerConfigFirebase(); } // valeur signée (avant/arrière)
 });
 document.getElementById('champ-ntrip').addEventListener('input', (e) => {
   const v = e.target.value.toUpperCase().trim();
   e.target.value = v; // reflète la mise en majuscules directement dans le champ
-  if (v){ etat.ntripMountpoint = v; envoyerConfigFirebase(); }
+  if (v){ etat.ntripMountpoint = v; majProfilActif('ntripMountpoint', v); envoyerConfigFirebase(); }
 });
 
 function selectionnerCote(cote){
   etat.cote = cote;
   document.getElementById('cote-gauche').classList.toggle('actif', cote === 'gauche');
   document.getElementById('cote-droite').classList.toggle('actif', cote === 'droite');
+  majProfilActif('cote', cote);
   envoyerConfigFirebase();
 }
 document.getElementById('cote-gauche').addEventListener('click', () => selectionnerCote('gauche'));
