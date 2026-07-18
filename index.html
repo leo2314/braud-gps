@@ -154,6 +154,16 @@
   .ligne-parcelle-barre{ height:5px; border-radius:4px; background:var(--border); margin-top:8px; overflow:hidden; }
   .ligne-parcelle-remplissage{ height:100%; background:var(--accent-green); transition:width 0.4s ease; }
   .ligne-parcelle-surface{ margin-top:6px; font-size:12px; color:var(--text-dim); }
+
+  /* En-tête global du panneau Statistiques : 2 cartes (surface totale / réalisé du jour) */
+  .stats-entete{ display:flex; gap:10px; margin-bottom:14px; }
+  .stats-carte{
+    flex:1; display:flex; flex-direction:column; gap:4px;
+    background:var(--surface-2); border:1px solid var(--border); border-left-width:3px;
+    border-radius:10px; padding:12px 14px;
+  }
+  .stats-carte-label{ font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--text-dim); }
+  .stats-carte-valeur{ font-family:var(--font-mono); font-size:20px; font-weight:700; line-height:1.1; }
   .ligne-parcelle-actions{ display:flex; gap:8px; margin-top:10px; }
   .btn-editer-cepage, .btn-effacer-parcelle{
     flex:1; padding:8px 6px; font-size:12px; font-weight:600; border-radius:8px; cursor:pointer;
@@ -324,6 +334,7 @@
   <button id="bouton-panneau-parcelles" class="bouton-bandeau" aria-label="Parcelles">🗺️</button>
   <button id="bouton-panneau-statistiques" class="bouton-bandeau" aria-label="Statistiques">📊</button>
   <button id="bouton-panneau" class="bouton-bandeau" aria-label="Réglages">⚙</button>
+  <button id="bouton-plein-ecran" class="bouton-bandeau" aria-label="Plein écran">⛶</button>
 </div>
 
 <div id="voile"></div>
@@ -580,19 +591,9 @@ const coucheOSM = L.tileLayer(
 // --- Cadastre francais (WMS Geoplateforme IGN) ---
 // Parcellaire Express : limites cadastrales officielles, PNG transparent,
 // superposable au fond satellite (case a cocher dans le controleur de calques).
-const coucheCadastre = L.tileLayer.wms('https://data.geopf.fr/wms-v/wms', {
-  layers: 'CADASTRALPARCELS.PARCELLAIRE_EXPRESS',
-  format: 'image/png',
-  transparent: true,
-  version: '1.3.0',
-  styles: '',
-  maxZoom: 22,
-  attribution: '© IGN — Cadastre'
-});
-
 L.control.layers(
   { 'Satellite': coucheSatellite, 'Plan (OSM)': coucheOSM },  // fonds exclusifs (radio)
-  { 'Cadastre (IGN)': coucheCadastre },                        // superposition (checkbox)
+  {},                                                          // plus d'overlay
   { position:'bottomleft' }
 ).addTo(carte);
 
@@ -690,6 +691,8 @@ function demarrerNouveauTrace(){
   traceCourante = {
     pointsGauche: [],
     pointsDroite: [],
+    dernierCapAncre: null, // cap du dernier point d'ancrage posé (pour détecter un vrai changement de direction)
+    nbPointsRecus: 0,      // nombre de trames GPS reçues (le chunking s'y réfère, pas à la longueur du tableau)
     // fillRule:'nonzero' (au lieu du 'evenodd' par défaut du SVG) : l'intérieur du ruban reste
     // toujours rempli même quand le tracé se recroise lui-même (manœuvres, demi-tours, etc.)
     // Couleur "Bleu New Holland" (#0054A6)
@@ -771,18 +774,34 @@ function ajouterPointPeinture(latDeg, lonDeg, capDeg){
   if (!traceCourante) demarrerNouveauTrace();
   majBoutonPeintureSelonZone('actif');
 
-  traceCourante.pointsGauche.push([bordGauche.lat, bordGauche.lon]);
-  traceCourante.pointsDroite.push([bordDroit.lat, bordDroit.lon]);
+  traceCourante.nbPointsRecus++;
+
+  // Calcul de la différence de cap (gestion du passage 359° -> 1°)
+  let diffCap = traceCourante.dernierCapAncre !== null ? Math.abs(capDeg - traceCourante.dernierCapAncre) : 0;
+  if (diffCap > 180) diffCap = 360 - diffCap;
+
+  // Si on a moins de 2 points OU que le cap a changé de plus de 3 degrés : on pose une nouvelle ancre
+  if (traceCourante.pointsGauche.length < 2 || diffCap >= 3) {
+    traceCourante.pointsGauche.push([bordGauche.lat, bordGauche.lon]);
+    traceCourante.pointsDroite.push([bordDroit.lat, bordDroit.lon]);
+    traceCourante.dernierCapAncre = capDeg;
+  }
+  // Sinon (Ligne droite) : on écrase le dernier point pour "étirer" le rectangle parfait
+  else {
+    const dernierIndex = traceCourante.pointsGauche.length - 1;
+    traceCourante.pointsGauche[dernierIndex] = [bordGauche.lat, bordGauche.lon];
+    traceCourante.pointsDroite[dernierIndex] = [bordDroit.lat, bordDroit.lon];
+  }
 
   const ruban = traceCourante.pointsGauche.concat(traceCourante.pointsDroite.slice().reverse());
   traceCourante.polygone.setLatLngs(ruban);
 
   // --- Sauvegarde continue par blocs (chunking) ---
-  // Au-delà de 60 points, on clôt le bloc courant (envoyé à Firebase par finaliserTrace)
-  // et on en ouvre un nouveau immédiatement. En cas de rafraîchissement du navigateur,
-  // on ne perd au pire que le dernier bloc en cours au lieu de tout le tracé.
-  // Les blocs se chevauchent visuellement au dernier point, la peinture reste continue.
-  if (traceCourante.pointsGauche.length > 60){
+  // Au-delà de 60 trames GPS reçues, on clôt le bloc courant (envoyé à Firebase par finaliserTrace)
+  // et on en ouvre un nouveau immédiatement. Le compteur se base sur nbPointsRecus (et non la
+  // longueur du tableau, qui ne reflète plus la fréquence GPS depuis l'étirement de ligne).
+  // En cas de rafraîchissement du navigateur, on ne perd au pire que le dernier bloc en cours.
+  if (traceCourante.nbPointsRecus > 60){
     finaliserTrace();
     demarrerNouveauTrace();
   }
@@ -895,7 +914,7 @@ function finaliserTrace(){
   if (firebaseActif){
     const reference = dbRecolteTraces.push();
     tracesCreesLocalement.add(reference.key);
-    tracesParClé[reference.key] = { feature: polygone, calque: creerCalqueTrace(polygone, reference.key) };
+    tracesParClé[reference.key] = { feature: polygone, calque: creerCalqueTrace(polygone, reference.key), t: Date.now() };
     reference.set({
       geojson: polygone.geometry,
       t: firebase.database.ServerValue.TIMESTAMP
@@ -903,7 +922,7 @@ function finaliserTrace(){
   } else {
     // Pas de Firebase configuré : le tracé reste local, sous une clé interne (non synchronisée)
     const cleLocale = 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-    tracesParClé[cleLocale] = { feature: polygone, calque: creerCalqueTrace(polygone, cleLocale) };
+    tracesParClé[cleLocale] = { feature: polygone, calque: creerCalqueTrace(polygone, cleLocale), t: Date.now() };
   }
 }
 
@@ -956,6 +975,13 @@ function ajouterOuMajParcelle(cle, data){
   if (!etat.modeCave){
     calque.eachLayer(coucheIndividuelle => {
       coucheIndividuelle.on('pm:edit', () => gererEditionParcelle(cle, coucheIndividuelle));
+      // Gomme "par sommet" : quand le mode suppression Geoman est actif, un clic sur la parcelle
+      // retire le sommet le plus proche au lieu de supprimer toute la parcelle d'un coup.
+      coucheIndividuelle.on('click', (evenement) => {
+        if (!carte.pm.globalRemovalModeEnabled || !carte.pm.globalRemovalModeEnabled()) return;
+        L.DomEvent.stopPropagation(evenement);
+        supprimerSommetParcelle(cle, coucheIndividuelle, evenement.latlng);
+      });
     });
   }
 
@@ -983,6 +1009,12 @@ function ajouterOuMajParcelle(cle, data){
 
   mettreAJourEtiquetteParcelle(cle); // contenu initial de l'étiquette
   recalculerPourcentageParcelle(cle);
+
+  // Si le mode gomme est actif au moment d'un (re)dessin de cette parcelle (édition, synchro
+  // Firebase...), on régénère ses marqueurs de sommets pour qu'ils restent visibles et à jour.
+  if (!etat.modeCave && carte.pm && carte.pm.globalRemovalModeEnabled && carte.pm.globalRemovalModeEnabled()){
+    afficherSommetsParcelle(cle);
+  }
 }
 
 function supprimerParcelle(cle){
@@ -990,6 +1022,7 @@ function supprimerParcelle(cle){
     if (parcellesAffichees[cle].calque) carte.removeLayer(parcellesAffichees[cle].calque);
     if (parcellesAffichees[cle].etiquette) carte.removeLayer(parcellesAffichees[cle].etiquette);
   }
+  if (typeof masquerSommetsParcelle === 'function') masquerSommetsParcelle(cle); // retire ses marqueurs de sommets
   delete parcellesAffichees[cle];
   if (derniereParcelleTrouveeCle === cle) derniereParcelleTrouveeCle = null; // évite de référencer une parcelle disparue
   rafraichirListeParcellesUI();
@@ -1085,6 +1118,24 @@ if (!etat.modeCave){
     drawRectangle:false, drawCircle:false, drawText:false,
     drawPolygon:true, editMode:true, dragMode:false,
     cutPolygon:false, removalMode:true, rotateMode:false
+  });
+
+  // Mode gomme : on affiche des marqueurs visibles sur chaque sommet (comme les poignées
+  // du mode Édition) pour que le chauffeur VOIE les points qu'il peut supprimer. Chaque
+  // marqueur supprime précisément son sommet au clic (géré dans afficherSommetsParcelle).
+  // On désarme aussi tout mode Geoman résiduel sur les couches (pas de suppression totale).
+  carte.on('pm:globalremovalmodetoggled', (evenement) => {
+    if (evenement.enabled){
+      Object.values(parcellesAffichees).forEach(p => {
+        if (!p.calque) return;
+        p.calque.eachLayer(couche => {
+          if (couche.pm) couche.pm.disable();
+        });
+      });
+      afficherTousSommets();
+    } else {
+      masquerTousSommets();
+    }
   });
 
   carte.on('pm:create', (evenement) => {
@@ -1187,6 +1238,114 @@ function gererEditionParcelle(cle, coucheEditee){
     // Pas de Firebase (ou parcelle purement locale) : on applique nous-mêmes le changement
     ajouterOuMajParcelle(cle, donneesMaj);
   }
+}
+
+// --- Gomme "par sommet" ---
+// Supprime UN sommet du contour : soit celui explicitement désigné (indexExplicite,
+// quand on clique un marqueur de sommet), soit le plus proche du clic (fallback si on
+// clique sur le corps du polygone). Utile sur mobile où le clic droit n'existe pas.
+function supprimerSommetParcelle(cle, couche, latlngClic, indexExplicite){
+  if (etat.modeCave) return;
+  const parcelle = parcellesAffichees[cle];
+  if (!parcelle) return;
+
+  // getLatLngs() d'un polygone renvoie un tableau d'anneaux ; on travaille sur l'anneau extérieur [0]
+  let anneaux = couche.getLatLngs();
+  // Cas polygone simple : Leaflet peut renvoyer directement un tableau de points -> on normalise
+  let anneauExterieur = Array.isArray(anneaux[0]) ? anneaux[0] : anneaux;
+
+  if (!anneauExterieur || anneauExterieur.length === 0) return;
+
+  // Détermine l'index du sommet à retirer
+  let indexACibler = -1;
+  if (typeof indexExplicite === 'number'){
+    indexACibler = indexExplicite; // clic direct sur un marqueur de sommet -> suppression précise
+  } else if (latlngClic){
+    // Fallback : clic sur le corps du polygone -> sommet le plus proche
+    let distanceMin = Infinity;
+    anneauExterieur.forEach((sommet, i) => {
+      const d = latlngClic.distanceTo(sommet); // distance en mètres (Leaflet)
+      if (d < distanceMin){ distanceMin = d; indexACibler = i; }
+    });
+  }
+  if (indexACibler < 0 || indexACibler >= anneauExterieur.length) return;
+
+  // Retire ce sommet
+  anneauExterieur.splice(indexACibler, 1);
+
+  if (anneauExterieur.length >= 3){
+    // Le polygone reste valide : on applique les nouvelles coordonnées et on synchronise
+    couche.setLatLngs(anneauExterieur);
+    gererEditionParcelle(cle, couche);
+    // Rafraîchit immédiatement les marqueurs de sommets pour refléter le point disparu
+    // (le redessin Firebase arrivera ensuite et les recréera de toute façon)
+    afficherSommetsParcelle(cle);
+  } else {
+    // Moins de 3 sommets : le polygone ne peut plus exister -> suppression complète
+    masquerSommetsParcelle(cle);
+    supprimerParcelle(cle);
+    if (firebaseActif && !cle.startsWith('local-')){
+      dbParcelles.child(cle).remove()
+        .catch(erreur => console.error('Échec de la suppression de la parcelle :', erreur));
+    }
+  }
+}
+
+/* ================================================================
+   6ter. MARQUEURS DE SOMMETS — feedback visuel de la gomme par point
+   ================================================================
+   Quand le mode gomme est actif, on affiche un petit rond sur chaque sommet des
+   parcelles (comme les poignées du mode Édition). Chaque rond est cliquable et
+   supprime précisément SON sommet. Un registre sommetsMarqueurs garde la trace
+   des LayerGroup pour pouvoir les retirer proprement.
+*/
+const sommetsMarqueurs = {}; // cle parcelle -> L.LayerGroup de marqueurs de sommets
+
+function afficherSommetsParcelle(cle){
+  masquerSommetsParcelle(cle); // repart d'un état propre (utile après une suppression)
+  const parcelle = parcellesAffichees[cle];
+  if (!parcelle || !parcelle.calque) return;
+
+  const groupe = L.layerGroup().addTo(carte);
+
+  parcelle.calque.eachLayer(couche => {
+    if (typeof couche.getLatLngs !== 'function') return;
+    const anneaux = couche.getLatLngs();
+    const anneauExterieur = Array.isArray(anneaux[0]) ? anneaux[0] : anneaux;
+
+    anneauExterieur.forEach((sommet, i) => {
+      const marqueur = L.circleMarker(sommet, {
+        radius: 7,
+        color: '#E5484D',        // cerclage rouge (couleur de suppression)
+        weight: 2,
+        fillColor: '#FFFFFF',    // centre blanc, bien visible sur le satellite
+        fillOpacity: 1,
+        interactive: true
+      }).addTo(groupe);
+
+      marqueur.on('click', (evenement) => {
+        L.DomEvent.stopPropagation(evenement);
+        supprimerSommetParcelle(cle, couche, null, i); // suppression précise de CE sommet
+      });
+    });
+  });
+
+  sommetsMarqueurs[cle] = groupe;
+}
+
+function masquerSommetsParcelle(cle){
+  if (sommetsMarqueurs[cle]){
+    carte.removeLayer(sommetsMarqueurs[cle]);
+    delete sommetsMarqueurs[cle];
+  }
+}
+
+function afficherTousSommets(){
+  Object.keys(parcellesAffichees).forEach(afficherSommetsParcelle);
+}
+
+function masquerTousSommets(){
+  Object.keys(sommetsMarqueurs).forEach(masquerSommetsParcelle);
 }
 
 /* ================================================================
@@ -1403,7 +1562,7 @@ function rafraichirListeParcellesUI(){
   }
 
   conteneur.innerHTML = cles
-    .sort((a, b) => parcellesAffichees[a].data.nom.localeCompare(parcellesAffichees[b].data.nom))
+    .sort((a, b) => parcellesAffichees[a].data.nom.localeCompare(parcellesAffichees[b].data.nom, undefined, { numeric: true, sensitivity: 'base' }))
     .map(cle => {
       const p = parcellesAffichees[cle];
       const pct = Math.round(p.pourcentage || 0);
@@ -1464,6 +1623,30 @@ function calculerStatistiquesCepages(){
   return groupes;
 }
 
+// Calcule la surface nette (sans double-comptage des chevauchements) réalisée aujourd'hui,
+// à partir des timestamps .t stockés dans tracesParClé. Retourne un nombre en hectares.
+function calculerSurfaceAujourdhuiHa(){
+  const maintenant = new Date();
+  const debutAujourdhui = new Date(maintenant.getFullYear(), maintenant.getMonth(), maintenant.getDate()).getTime();
+  const finAujourdhui = debutAujourdhui + 24 * 60 * 60 * 1000 - 1;
+
+  let zoneAujourdhui = null;
+  for (const cle of Object.keys(tracesParClé)){
+    const trace = tracesParClé[cle];
+    if (typeof trace.t !== 'number') continue;              // tracé sans horodatage : ignoré
+    if (trace.t < debutAujourdhui || trace.t > finAujourdhui) continue; // hors de la journée en cours
+
+    try{
+      const entree = nettoyerGeometrie(trace.feature);       // robustesse anti auto-intersection
+      zoneAujourdhui = zoneAujourdhui ? nettoyerGeometrie(turf.union(zoneAujourdhui, entree)) : entree;
+    }catch(erreur){
+      console.error('Tracé ' + cle + ' ignoré dans le calcul du jour :', erreur);
+    }
+  }
+
+  return zoneAujourdhui ? +(turf.area(zoneAujourdhui) / 10000).toFixed(2) : 0.0;
+}
+
 function rafraichirStatistiquesUI(){
   const conteneur = document.getElementById('liste-statistiques');
   if (!conteneur) return; // sécurité si appelée avant que le DOM du panneau ne soit prêt
@@ -1471,26 +1654,46 @@ function rafraichirStatistiquesUI(){
   const groupes = calculerStatistiquesCepages();
   const cepages = Object.keys(groupes);
 
+  // --- En-tête global : surface totale des parcelles + surface réalisée aujourd'hui ---
+  let surfaceTotaleHa = 0;
+  Object.values(parcellesAffichees).forEach(p => { surfaceTotaleHa += p.data.surfaceHa; });
+  const surfaceAujourdhuiHa = calculerSurfaceAujourdhuiHa();
+
+  const enteteGlobal = `
+    <div class="stats-entete">
+      <div class="stats-carte" style="border-color:var(--accent-jaune);">
+        <span class="stats-carte-label">Surface totale</span>
+        <span class="stats-carte-valeur" style="color:var(--accent-jaune);">${surfaceTotaleHa.toFixed(2)} Ha</span>
+      </div>
+      <div class="stats-carte" style="border-color:var(--accent-green);">
+        <span class="stats-carte-label">Réalisé aujourd'hui</span>
+        <span class="stats-carte-valeur" style="color:var(--accent-green);">${surfaceAujourdhuiHa.toFixed(2)} Ha</span>
+      </div>
+    </div>`;
+
+  // --- Détail par cépage ---
+  let detailCepages;
   if (cepages.length === 0){
-    conteneur.innerHTML = '<p class="parcelle-vide">Aucune parcelle pour le moment.</p>';
-    return;
+    detailCepages = '<p class="parcelle-vide">Aucune parcelle pour le moment.</p>';
+  } else {
+    detailCepages = cepages
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+      .map(cepage => {
+        const g = groupes[cepage];
+        const pct = g.totalHa > 0 ? Math.min(100, (g.recolteHa / g.totalHa) * 100) : 0;
+        return `
+          <div class="ligne-parcelle">
+            <div class="ligne-parcelle-entete">
+              <span class="ligne-parcelle-nom">${echapperHTML(cepage)}</span>
+              <span class="ligne-parcelle-pct">${Math.round(pct)}%</span>
+            </div>
+            <div class="ligne-parcelle-barre"><div class="ligne-parcelle-remplissage" style="width:${Math.min(pct,100)}%"></div></div>
+            <div class="ligne-parcelle-surface">${g.recolteHa.toFixed(2)} Ha / ${g.totalHa.toFixed(2)} Ha récoltés</div>
+          </div>`;
+      }).join('');
   }
 
-  conteneur.innerHTML = cepages
-    .sort((a, b) => a.localeCompare(b))
-    .map(cepage => {
-      const g = groupes[cepage];
-      const pct = g.totalHa > 0 ? Math.min(100, (g.recolteHa / g.totalHa) * 100) : 0;
-      return `
-        <div class="ligne-parcelle">
-          <div class="ligne-parcelle-entete">
-            <span class="ligne-parcelle-nom">${echapperHTML(cepage)}</span>
-            <span class="ligne-parcelle-pct">${Math.round(pct)}%</span>
-          </div>
-          <div class="ligne-parcelle-barre"><div class="ligne-parcelle-remplissage" style="width:${Math.min(pct,100)}%"></div></div>
-          <div class="ligne-parcelle-surface">${g.recolteHa.toFixed(2)} Ha / ${g.totalHa.toFixed(2)} Ha récoltés</div>
-        </div>`;
-    }).join('');
+  conteneur.innerHTML = enteteGlobal + detailCepages;
 }
 
 /* ================================================================
@@ -1748,7 +1951,7 @@ if (firebaseActif){
     if (!d || !d.geojson) return;
     try{
       const feature = turf.feature(d.geojson);
-      tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key) };
+      tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key), t: d.t || Date.now() };
       const entree = nettoyerGeometrie(feature);
       etat.zoneRecolteTotale = nettoyerGeometrie(etat.zoneRecolteTotale ? turf.union(etat.zoneRecolteTotale, entree) : entree);
       recalculerToutesParcelles();
@@ -1759,6 +1962,7 @@ if (firebaseActif){
 
   // Un tracé existant a été MODIFIÉ (découpé par turf.difference lors d'un effacement ciblé)
   dbRecolteTraces.on('child_changed', snap => {
+    const ancienT = tracesParClé[snap.key] ? tracesParClé[snap.key].t : Date.now();
     if (tracesParClé[snap.key]) carte.removeLayer(tracesParClé[snap.key].calque);
     delete tracesParClé[snap.key];
 
@@ -1766,7 +1970,7 @@ if (firebaseActif){
     if (d && d.geojson){
       try{
         const feature = turf.feature(d.geojson);
-        tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key) };
+        tracesParClé[snap.key] = { feature, calque: creerCalqueTrace(d.geojson, snap.key), t: d.t || ancienT };
       }catch(erreur){
         console.error('Mise à jour de tracé ignorée (géométrie invalide) :', erreur);
       }
@@ -1859,6 +2063,36 @@ document.getElementById('bouton-panneau').addEventListener('click', () => ouvrir
 document.getElementById('bouton-panneau-parcelles').addEventListener('click', () => ouvrirPanneau(panneauParcelles));
 document.getElementById('bouton-panneau-statistiques').addEventListener('click', () => ouvrirPanneau(panneauStatistiques));
 voile.addEventListener('click', fermerPanneaux);
+
+/* ================================================================
+   11ter. PLEIN ÉCRAN (Fullscreen API, compatible desktop + tablette/mobile)
+   ================================================================ */
+// Détecte l'élément actuellement en plein écran (préfixes inclus pour Safari/anciens navigateurs)
+function elementPleinEcran(){
+  return document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || null;
+}
+
+function basculerPleinEcran(){
+  const racine = document.documentElement;
+  if (!elementPleinEcran()){
+    const demander = racine.requestFullscreen || racine.webkitRequestFullscreen || racine.mozRequestFullScreen;
+    if (demander) demander.call(racine).catch(err => console.error('Passage en plein écran impossible :', err));
+  } else {
+    const quitter = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen;
+    if (quitter) quitter.call(document).catch(err => console.error('Sortie du plein écran impossible :', err));
+  }
+}
+
+// Met à jour l'icône selon l'état réel (l'utilisateur peut aussi sortir avec la touche Échap)
+function majIconePleinEcran(){
+  const bouton = document.getElementById('bouton-plein-ecran');
+  if (bouton) bouton.textContent = elementPleinEcran() ? '🡼' : '⛶';
+}
+
+document.getElementById('bouton-plein-ecran').addEventListener('click', basculerPleinEcran);
+document.addEventListener('fullscreenchange', majIconePleinEcran);
+document.addEventListener('webkitfullscreenchange', majIconePleinEcran);
+document.addEventListener('mozfullscreenchange', majIconePleinEcran);
 
 // Persiste une modification de réglage dans le profil de tracteur actif (Firebase).
 // Sans ça, appliquerProfilTracteur() rechargerait l'ancienne valeur au prochain
