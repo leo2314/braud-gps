@@ -2305,12 +2305,14 @@ if (firebaseActif) {
     if (liste) {
       profilsTracteurs = liste;
       rafraichirSelectProfils();
+      appliquerProfilTracteur(profilActifNom); // applique les vraies valeurs du profil une fois la liste reçue
     } else {
       // Aucune liste sur Firebase : première utilisation -> on migre les profils
       // locaux de cet appareil (ou le profil par défaut) vers le cloud.
       const local = chargerProfilsTracteurs();
       profilsTracteurs = local || [{ nom: 'Braud SB35', largeurM: 2.50, offsetM: 1.20, cote: 'droite', offsetLongitudinalM: 0, ntripMountpoint: 'IGNU' }];
       if (!etat.modeCave) dbProfilsListe.set(profilsTracteurs);
+      appliquerProfilTracteur(profilActifNom); // applique le profil migré/par défaut
     }
   });
 
@@ -2350,7 +2352,10 @@ document.getElementById('bouton-recentrer').classList.toggle('visible', !etat.su
 requestAnimationFrame(boucleAnimationFluide);
 
 if (!etat.modeCave){
-  envoyerConfigFirebase(); // initialise machine/config pour que la Cave parte avec les bonnes valeurs
+  // Ne PAS appeler envoyerConfigFirebase() ici : au démarrage, l'état contient encore les valeurs
+  // par défaut (2.50 / 1.20) et les pousserait sur Firebase AVANT la réception du vrai profil
+  // (race condition). C'est appliquerProfilTracteur() — déclenché par l'écouteur dbProfilsListe —
+  // qui pousse la bonne config, au bon moment.
   // La peinture démarre sur ON d'office : le chauffeur n'a pas à y penser en entrant
   // dans la première parcelle (le geofencing gèle de toute façon le tracé hors parcelle).
   definirPeinture(true);
