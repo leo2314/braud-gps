@@ -148,7 +148,7 @@
   #liste-parcelles{ display:flex; flex-direction:column; gap:10px; }
   .parcelle-vide{ color:var(--text-dim); font-size:13px; margin:0; }
   .ligne-parcelle{ background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
-  .ligne-parcelle-entete{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .ligne-parcelle-entete{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; cursor:pointer; }
   .ligne-parcelle-nom{ font-size:14px; font-weight:600; }
   .ligne-parcelle-pct{ font-family:var(--font-mono); font-size:15px; font-weight:700; flex:0 0 auto; }
   .ligne-parcelle-barre{ height:5px; border-radius:4px; background:var(--border); margin-top:8px; overflow:hidden; }
@@ -164,6 +164,15 @@
   }
   .stats-carte-label{ font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--text-dim); }
   .stats-carte-valeur{ font-family:var(--font-mono); font-size:20px; font-weight:700; line-height:1.1; }
+
+  /* Carte d'avancement global (barre pleine largeur sous les 2 petites cartes) */
+  .stats-avancement{
+    background:var(--surface-2); border:1px solid var(--border); border-left:3px solid var(--accent-green);
+    border-radius:10px; padding:12px 14px; margin-bottom:14px;
+  }
+  .stats-avancement-entete{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .stats-avancement-pct{ font-family:var(--font-mono); font-size:22px; font-weight:700; color:var(--accent-green); }
+  .stats-avancement-detail{ margin-top:6px; font-size:12px; color:var(--text-dim); }
   .ligne-parcelle-actions{ display:flex; gap:8px; margin-top:10px; }
   .btn-editer-cepage, .btn-effacer-parcelle{
     flex:1; padding:8px 6px; font-size:12px; font-weight:600; border-radius:8px; cursor:pointer;
@@ -1568,7 +1577,7 @@ function rafraichirListeParcellesUI(){
       const pct = Math.round(p.pourcentage || 0);
       return `
         <div class="ligne-parcelle">
-          <div class="ligne-parcelle-entete">
+          <div class="ligne-parcelle-entete" data-cle="${cle}" title="Cliquer pour centrer la carte sur cette parcelle">
             <span class="ligne-parcelle-nom">${echapperHTML(p.data.nom)}</span>
             <span class="ligne-parcelle-pct">${pct}%</span>
           </div>
@@ -1580,6 +1589,13 @@ function rafraichirListeParcellesUI(){
           </div>
         </div>`;
     }).join('');
+
+  // Clic sur l'en-tête (nom + %) : centre et zoome la carte sur la parcelle
+  conteneur.querySelectorAll('.ligne-parcelle-entete').forEach(entete => {
+    entete.addEventListener('click', () => {
+      centrerSurParcelle(entete.getAttribute('data-cle'));
+    });
+  });
 
   // Délégation des clics (le HTML vient d'être entièrement régénéré ci-dessus)
   conteneur.querySelectorAll('.btn-editer-cepage').forEach(bouton => {
@@ -1602,6 +1618,32 @@ function rafraichirListeParcellesUI(){
   });
 
   rafraichirStatistiquesUI();
+}
+
+// Centre et zoome la carte sur une parcelle (clic sur son en-tête dans le panneau).
+// Coupe le suivi caméra (sinon la boucle 60 FPS ramènerait aussitôt la vue sur le tracteur)
+// et ferme le panneau pour dégager la carte.
+function centrerSurParcelle(cle){
+  const parcelle = parcellesAffichees[cle];
+  if (!parcelle || !parcelle.calque) return;
+
+  let limites;
+  try{
+    limites = parcelle.calque.getBounds();
+  }catch(erreur){
+    console.error('Limites de la parcelle indisponibles :', erreur);
+    return;
+  }
+  if (!limites || !limites.isValid()) return;
+
+  // Désactive le suivi automatique pour que la vue reste sur la parcelle
+  // (selectionnerSuivi met aussi à jour les boutons et affiche le bouton "Recentrer")
+  if (etat.suivreCamera) selectionnerSuivi(false);
+
+  fermerPanneaux();
+
+  // padding pour que la parcelle ne colle pas aux bords ; maxZoom évite un sur-zoom sur une micro-parcelle
+  carte.fitBounds(limites, { padding:[60, 60], maxZoom:19, animate:true });
 }
 
 /* ================================================================
@@ -1654,10 +1696,16 @@ function rafraichirStatistiquesUI(){
   const groupes = calculerStatistiquesCepages();
   const cepages = Object.keys(groupes);
 
-  // --- En-tête global : surface totale des parcelles + surface réalisée aujourd'hui ---
+  // --- En-tête global : surface totale, récolté total (avancement) + réalisé aujourd'hui ---
   let surfaceTotaleHa = 0;
   Object.values(parcellesAffichees).forEach(p => { surfaceTotaleHa += p.data.surfaceHa; });
+
+  // Récolté total = somme des surfaces récoltées de chaque cépage (déjà calculées par cépage)
+  let surfaceRecolteeHa = 0;
+  Object.values(groupes).forEach(g => { surfaceRecolteeHa += g.recolteHa; });
+
   const surfaceAujourdhuiHa = calculerSurfaceAujourdhuiHa();
+  const pctGlobal = surfaceTotaleHa > 0 ? Math.min(100, (surfaceRecolteeHa / surfaceTotaleHa) * 100) : 0;
 
   const enteteGlobal = `
     <div class="stats-entete">
@@ -1669,6 +1717,16 @@ function rafraichirStatistiquesUI(){
         <span class="stats-carte-label">Réalisé aujourd'hui</span>
         <span class="stats-carte-valeur" style="color:var(--accent-green);">${surfaceAujourdhuiHa.toFixed(2)} Ha</span>
       </div>
+    </div>
+    <div class="stats-avancement">
+      <div class="stats-avancement-entete">
+        <span class="stats-carte-label">Avancement global</span>
+        <span class="stats-avancement-pct">${Math.round(pctGlobal)}%</span>
+      </div>
+      <div class="ligne-parcelle-barre" style="margin-top:8px;">
+        <div class="ligne-parcelle-remplissage" style="width:${Math.min(pctGlobal,100)}%"></div>
+      </div>
+      <div class="stats-avancement-detail">${surfaceRecolteeHa.toFixed(2)} Ha / ${surfaceTotaleHa.toFixed(2)} Ha récoltés</div>
     </div>`;
 
   // --- Détail par cépage ---
